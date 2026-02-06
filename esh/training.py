@@ -16,7 +16,17 @@ from typing import Optional, Dict, Any, Callable
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+
+# Compatible with both PyTorch 1.x and 2.x
+try:
+    from torch.amp import autocast as _autocast  # PyTorch 2.0+
+    def amp_autocast(dtype, enabled):
+        return _autocast(device_type="cuda", dtype=dtype, enabled=enabled)
+except ImportError:
+    from torch.cuda.amp import autocast as _autocast  # PyTorch 1.x
+    def amp_autocast(dtype, enabled):
+        return _autocast(enabled=enabled)
 
 
 @dataclass
@@ -181,7 +191,7 @@ class Trainer:
         self.model.config.target_attention_ratio = target_ratio
         
         # Forward pass with AMP
-        with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.config.use_amp):
+        with amp_autocast(dtype=self.amp_dtype, enabled=self.config.use_amp):
             outputs = self.model(input_ids, labels=labels, return_routing_stats=True)
             loss = outputs["loss"]
             aux_loss = outputs["aux_loss"]
@@ -250,7 +260,7 @@ class Trainer:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch.get("labels", input_ids).to(self.device)
             
-            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.config.use_amp):
+            with amp_autocast(dtype=self.amp_dtype, enabled=self.config.use_amp):
                 outputs = self.model(input_ids, labels=labels, return_routing_stats=True)
             
             batch_tokens = (labels != -100).sum().item()
