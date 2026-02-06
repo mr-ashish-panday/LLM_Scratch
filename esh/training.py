@@ -28,6 +28,15 @@ except ImportError:
     def amp_autocast(dtype, enabled):
         return _autocast(enabled=enabled)
 
+# Try to import bitsandbytes for 8-bit optimizer
+try:
+    import bitsandbytes as bnb
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
+    print("Note: bitsandbytes not installed. Using standard AdamW.")
+
+
 
 @dataclass
 class TrainingConfig:
@@ -52,6 +61,7 @@ class TrainingConfig:
     # Memory optimization
     use_amp: bool = True  # Automatic Mixed Precision
     amp_dtype: str = "bfloat16"  # "float16" or "bfloat16"
+    use_8bit_optimizer: bool = True  # Use 8-bit AdamW if bitsandbytes available
     
     # Logging
     log_interval: int = 10
@@ -64,6 +74,7 @@ class TrainingConfig:
     # Burn-in phase (force balanced routing initially)
     burn_in_steps: int = 1000  # Steps before router takes full control
     initial_attention_ratio: float = 0.5  # Start with 50/50
+
 
 
 class Trainer:
@@ -112,7 +123,10 @@ class Trainer:
         Path(config.output_dir).mkdir(parents=True, exist_ok=True)
         
     def _configure_optimizer(self) -> torch.optim.Optimizer:
-        """Configure AdamW with weight decay on non-bias/norm parameters."""
+        """Configure AdamW with weight decay on non-bias/norm parameters.
+        
+        Uses 8-bit PagedAdamW if bitsandbytes is available for ~3GB VRAM savings.
+        """
         # Separate parameters that should and shouldn't have weight decay
         decay_params = []
         nodecay_params = []
@@ -131,14 +145,25 @@ class Trainer:
             {"params": nodecay_params, "weight_decay": 0.0},
         ]
         
-        optimizer = torch.optim.AdamW(
-            optim_groups,
-            lr=self.config.learning_rate,
-            betas=(self.config.beta1, self.config.beta2),
-            fused=torch.cuda.is_available(),  # Faster on CUDA
-        )
+        # Use 8-bit optimizer if available and enabled
+        if BNB_AVAILABLE and self.config.use_8bit_optimizer:
+            print("Using 8-bit PagedAdamW (saves ~3GB VRAM)")
+            optimizer = bnb.optim.PagedAdamW8bit(
+                optim_groups,
+                lr=self.config.learning_rate,
+                betas=(self.config.beta1, self.config.beta2),
+            )
+        else:
+            # Fallback to standard AdamW
+            optimizer = torch.optim.AdamW(
+                optim_groups,
+                lr=self.config.learning_rate,
+                betas=(self.config.beta1, self.config.beta2),
+                fused=torch.cuda.is_available(),  # Faster on CUDA
+            )
         
         return optimizer
+
     
     def _get_lr(self) -> float:
         """Compute learning rate with warmup and decay."""

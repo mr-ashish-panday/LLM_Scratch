@@ -402,6 +402,171 @@ class SwiGLUExpert(nn.Module):
 
 
 # =============================================================================
+# Scalable MoE (16 Experts for Virtual Scaling)
+# =============================================================================
+
+class ScalableMoE(nn.Module):
+    """
+    16-Expert Top-1 MoE for Virtual Scaling.
+    
+    The key insight: 16 experts = 4x more parameters (capacity),
+    but Top-1 selection = same activation memory as 4-expert.
+    
+    Features:
+    - 16 experts for ~1.5B total capacity
+    - Top-1 routing (only 1 expert active per token)
+    - Expert dropout for regularization
+    - Auxiliary load balancing loss
+    - Z-loss for router stability
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        n_experts: int = 16,
+        expert_dim: Optional[int] = None,
+        top_k: int = 1,
+        capacity_factor: float = 1.25,
+        aux_loss_weight: float = 0.01,
+        z_loss_weight: float = 0.001,
+        expert_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.expert_dim = expert_dim or d_model * 4
+        self.capacity_factor = capacity_factor
+        self.aux_loss_weight = aux_loss_weight
+        self.z_loss_weight = z_loss_weight
+        self.expert_dropout = expert_dropout
+        
+        # Router with noise for exploration
+        self.gate = nn.Linear(d_model, n_experts, bias=False)
+        
+        # 16 SwiGLU experts
+        self.experts = nn.ModuleList([
+            SwiGLUExpert(d_model, self.expert_dim)
+            for _ in range(n_experts)
+        ])
+        
+        # Jitter noise scale for load balancing
+        self.jitter_noise = 0.01
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        nn.init.normal_(self.gate.weight, std=0.02)
+        
+    def _add_jitter(self, x: torch.Tensor) -> torch.Tensor:
+        """Add multiplicative jitter for better load balancing."""
+        if self.training and self.jitter_noise > 0:
+            noise = 1.0 + torch.rand_like(x) * self.jitter_noise
+            return x * noise
+        return x
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [batch, seq_len, d_model]
+            
+        Returns:
+            output: [batch, seq_len, d_model]
+            aux_loss: scalar combined auxiliary loss
+        """
+        B, L, D = x.shape
+        x_flat = x.view(-1, D)  # [B*L, D]
+        N = x_flat.size(0)
+        
+        # Add jitter for exploration
+        x_jittered = self._add_jitter(x_flat)
+        
+        # Compute routing logits
+        logits = self.gate(x_jittered)  # [N, n_experts]
+        
+        # Apply expert dropout during training
+        if self.training and self.expert_dropout > 0:
+            mask = torch.rand(self.n_experts, device=x.device) > self.expert_dropout
+            logits = logits.masked_fill(~mask.unsqueeze(0), float('-inf'))
+        
+        # Softmax for probabilities
+        probs = F.softmax(logits, dim=-1)
+        
+        # Top-k selection (typically k=1)
+        top_probs, indices = probs.topk(self.top_k, dim=-1)  # [N, k], [N, k]
+        
+        # Normalize top-k probs
+        top_probs = top_probs / (top_probs.sum(dim=-1, keepdim=True) + 1e-9)
+        
+        # Dispatch to experts
+        output = torch.zeros_like(x_flat)
+        
+        for k in range(self.top_k):
+            for i in range(self.n_experts):
+                mask = (indices[:, k] == i)
+                if mask.any():
+                    expert_input = x_flat[mask]
+                    expert_out = self.experts[i](expert_input)
+                    output[mask] += expert_out * top_probs[mask, k].unsqueeze(-1)
+        
+        # Compute auxiliary losses
+        aux_loss = self._compute_aux_loss(logits, probs, indices[:, 0])
+        
+        return output.view(B, L, D), aux_loss
+    
+    def _compute_aux_loss(
+        self,
+        logits: torch.Tensor,
+        probs: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute combined auxiliary losses for stable training."""
+        N = probs.size(0)
+        
+        # 1. Load balancing loss
+        # Fraction of tokens routed to each expert
+        load = torch.zeros(self.n_experts, device=probs.device)
+        load.scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.float))
+        load = load / N
+        
+        # Average probability assigned to each expert
+        importance = probs.mean(dim=0)
+        
+        # Product-based load balancing
+        load_loss = (load * importance).sum() * self.n_experts
+        
+        # 2. Z-loss for router stability (prevents logits from growing too large)
+        z_loss = torch.logsumexp(logits, dim=-1).pow(2).mean()
+        
+        # Combined auxiliary loss
+        aux_loss = (
+            self.aux_loss_weight * load_loss +
+            self.z_loss_weight * z_loss
+        )
+        
+        return aux_loss
+    
+    def get_expert_load(self, x: torch.Tensor) -> dict:
+        """Get expert load statistics for monitoring."""
+        with torch.no_grad():
+            B, L, D = x.shape
+            x_flat = x.view(-1, D)
+            logits = self.gate(x_flat)
+            probs = F.softmax(logits, dim=-1)
+            _, indices = probs.max(dim=-1)
+            
+            load = torch.bincount(indices, minlength=self.n_experts).float()
+            load = load / load.sum()
+            
+            return {
+                "expert_load": load.cpu().tolist(),
+                "load_std": load.std().item(),
+                "max_load": load.max().item(),
+                "min_load": load.min().item(),
+            }
+
+
+# =============================================================================
 # LayerScale
 # =============================================================================
 
@@ -474,8 +639,11 @@ class ESHBlock(nn.Module):
         self.ls_ssm = LayerScale(d_model, layer_scale_init)
         self.ls_moe = LayerScale(d_model, layer_scale_init)
         
-        # MoE FFN
-        self.moe = Top1MoE(d_model, n_experts, expert_dim)
+        # MoE FFN - use ScalableMoE for > 4 experts (virtual scaling)
+        if n_experts > 4:
+            self.moe = ScalableMoE(d_model, n_experts, expert_dim)
+        else:
+            self.moe = Top1MoE(d_model, n_experts, expert_dim)
         
         self.dropout = nn.Dropout(dropout)
         

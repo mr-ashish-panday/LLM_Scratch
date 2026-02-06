@@ -346,3 +346,29 @@ def esh_large() -> ESHConfig:
         max_seq_len=2048,
         use_checkpoint=True,
     )
+
+
+def esh_scaled() -> ESHConfig:
+    """
+    ~1.5B total parameters (virtual) - 16 experts for maximum capacity.
+    
+    Active parameters per forward pass: ~500M
+    Total parameters (all experts): ~1.5B
+    Fits in 12GB VRAM via:
+    - 16-expert Top-1 MoE (only 1 active)
+    - 8-bit optimizer states
+    - Gradient checkpointing
+    - bfloat16 training
+    """
+    return ESHConfig(
+        d_model=1024,
+        n_layers=16,
+        n_heads=16,
+        n_experts=16,  # 16 experts = 4x capacity
+        expert_dim=4096,  # Each expert: 1024 -> 4096 -> 1024
+        max_seq_len=4096,
+        use_checkpoint=True,
+        dropout=0.0,
+        layer_scale_init=1e-5,
+    )
+
