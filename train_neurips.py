@@ -79,8 +79,8 @@ def main():
     # Training duration  
     MAX_STEPS = 100_000      # 100k steps for thorough training
     
-    # Sequence length (4096 for long-context)
-    MAX_SEQ_LEN = 4096
+    # Sequence length (2048 for 12GB fit, can scale to 4096 later)
+    MAX_SEQ_LEN = 2048
     
     # Batch settings (conservative for 12GB)
     BATCH_SIZE = 1           # Small batch for 4096 seq len
