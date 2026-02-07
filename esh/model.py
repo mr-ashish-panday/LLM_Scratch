@@ -350,24 +350,21 @@ def esh_large() -> ESHConfig:
 
 def esh_scaled() -> ESHConfig:
     """
-    Virtual Scaling config optimized for 12GB VRAM.
+    Virtual Scaling config for 12GB VRAM (RTX 3080 Ti).
     
-    Total capacity: ~1.5B params (16 experts)
-    Active params: ~350-450M per forward pass
-    Fits 12GB via:
-    - 16-expert Top-1 MoE (only 1 active)
-    - 8-bit optimizer states
-    - Gradient checkpointing
-    - bfloat16 training
+    Reduced to fit including backward pass:
+    - 8 experts (2x baseline, not 4x)
+    - 8 layers
+    - ~400M total params, ~200M active
     """
     return ESHConfig(
-        d_model=768,         # Reduced from 1024 for 12GB fit
-        n_layers=12,         # Reduced from 16
+        d_model=768,         # Keep 768 for quality
+        n_layers=8,          # Reduced from 12
         n_heads=12,          # Match d_model/64
-        n_experts=16,        # KEEP 16 experts for virtual scaling!
+        n_experts=8,         # Reduced from 16 (still 2x baseline!)
         expert_dim=3072,     # 4x d_model
-        max_seq_len=2048,    # Start at 2048, can scale to 4096 later
-        use_checkpoint=True,
+        max_seq_len=2048,    
+        use_checkpoint=True, # CRITICAL for memory
         dropout=0.0,
         layer_scale_init=1e-5,
     )
