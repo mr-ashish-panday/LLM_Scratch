@@ -100,23 +100,23 @@ def main():
     # Configuration
     # =========================================================================
     
-    # Training duration  
-    MAX_STEPS = 100_000      # 100k steps for thorough training
+    # Training duration (reduced for faster validation)
+    MAX_STEPS = 20_000       # 20k steps - ~2-3 days
     
     # Sequence length (2048 for 12GB fit)
     MAX_SEQ_LEN = 2048
     
-    # Batch settings (conservative for 12GB)
-    BATCH_SIZE = 1           # Small batch for memory
-    GRAD_ACCUM = 32          # Effective batch = 32
+    # Batch settings - INCREASED for speed (we have VRAM headroom)
+    BATCH_SIZE = 4           # Increased from 1 (4x faster per step)
+    GRAD_ACCUM = 8           # Reduced to keep effective batch = 32
     
     # Data limits (None = full dataset ~2.1M)
     MAX_TRAIN_SAMPLES = None
     MAX_EVAL_SAMPLES = 500   # Small eval set
     
     # Checkpointing
-    SAVE_INTERVAL = 10000    # Every 10k steps
-    EVAL_INTERVAL = 5000     # Every 5k steps
+    SAVE_INTERVAL = 5000     # Every 5k steps
+    EVAL_INTERVAL = 2000     # Every 2k steps
     
     # Resume from checkpoint (set path or None)
     RESUME_FROM = None
