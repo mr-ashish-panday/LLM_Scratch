@@ -106,9 +106,9 @@ def main():
     # Sequence length (2048 for 12GB fit)
     MAX_SEQ_LEN = 2048
     
-    # Batch settings - INCREASED for speed (we have VRAM headroom)
-    BATCH_SIZE = 4           # Increased from 1 (4x faster per step)
-    GRAD_ACCUM = 8           # Reduced to keep effective batch = 32
+    # Batch settings - balanced for speed + memory
+    BATCH_SIZE = 2           # Balanced (4 OOMs, 1 is too slow)
+    GRAD_ACCUM = 16          # Keep effective batch = 32
     
     # Data limits (None = full dataset ~2.1M)
     MAX_TRAIN_SAMPLES = None
