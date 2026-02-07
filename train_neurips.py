@@ -2,10 +2,10 @@
 ESH NeurIPS Training Script
 ===========================
 100,000-step training schedule optimized for Virtual Scaling:
-- 16-expert MoE (~1.5B capacity, ~500M active)
-- 4096 sequence length
+- 16-expert MoE (~1.5B capacity, ~400M active)
+- 2048 sequence length
 - 8-bit optimizer states
-- Full TinyStories dataset
+- Streaming TinyStories dataset (RAM efficient)
 
 Usage:
     nohup python -u train_neurips.py > training_neurips.log 2>&1 &
@@ -14,7 +14,7 @@ Usage:
 import os
 import sys
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoTokenizer
 
 from esh import ESHModel, ESHConfig
@@ -22,49 +22,73 @@ from esh.model import esh_scaled
 from esh.training import Trainer, TrainingConfig, print_memory_stats
 
 
-class TextDataset(Dataset):
-    """Simple text dataset with tokenization."""
+class StreamingTextDataset(IterableDataset):
+    """
+    Memory-efficient streaming dataset that tokenizes on-the-fly.
+    Doesn't load everything into RAM.
+    """
     
-    def __init__(self, texts: list, tokenizer, max_length: int = 4096):
+    def __init__(self, split: str, tokenizer, max_length: int = 2048, max_samples: int = None):
+        self.split = split
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.examples = []
+        self.max_samples = max_samples
         
-        print(f"Tokenizing {len(texts)} examples...")
-        for i, text in enumerate(texts):
-            if i % 50000 == 0:
-                print(f"  Progress: {i}/{len(texts)}")
+        # Get dataset size for length estimation
+        from datasets import load_dataset
+        ds = load_dataset("roneneldan/TinyStories", split=split, streaming=False)
+        self._length = min(len(ds), max_samples) if max_samples else len(ds)
+        del ds  # Free memory
+    
+    def __iter__(self):
+        from datasets import load_dataset
+        
+        dataset = load_dataset("roneneldan/TinyStories", split=self.split, streaming=True)
+        
+        for i, example in enumerate(dataset):
+            if self.max_samples and i >= self.max_samples:
+                break
+            
+            tokens = self.tokenizer(
+                example["text"],
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            yield {"input_ids": tokens["input_ids"].squeeze(0)}
+    
+    def __len__(self):
+        return self._length
+
+
+class SimpleTextDataset(torch.utils.data.Dataset):
+    """Small in-memory dataset for evaluation."""
+    
+    def __init__(self, split: str, tokenizer, max_length: int, max_samples: int = 1000):
+        from datasets import load_dataset
+        
+        print(f"Loading {max_samples} {split} examples for evaluation...")
+        dataset = load_dataset("roneneldan/TinyStories", split=split)
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+        
+        self.examples = []
+        for ex in dataset:
             tokens = tokenizer(
-                text,
+                ex["text"],
                 max_length=max_length,
                 truncation=True,
                 padding="max_length",
                 return_tensors="pt",
             )
             self.examples.append(tokens["input_ids"].squeeze(0))
-        print("Tokenization complete!")
+        print(f"  Loaded {len(self.examples)} eval examples")
     
     def __len__(self):
         return len(self.examples)
     
     def __getitem__(self, idx):
         return {"input_ids": self.examples[idx]}
-
-
-def load_tinystories(tokenizer, max_length: int, split: str, max_samples: int = None):
-    """Load TinyStories dataset."""
-    from datasets import load_dataset
-    
-    print(f"Loading TinyStories {split} split...")
-    dataset = load_dataset("roneneldan/TinyStories", split=split)
-    
-    if max_samples:
-        dataset = dataset.select(range(min(max_samples, len(dataset))))
-    
-    texts = [ex["text"] for ex in dataset]
-    print(f"Loaded {len(texts)} examples from {split}")
-    
-    return TextDataset(texts, tokenizer, max_length)
 
 
 def main():
@@ -79,16 +103,16 @@ def main():
     # Training duration  
     MAX_STEPS = 100_000      # 100k steps for thorough training
     
-    # Sequence length (2048 for 12GB fit, can scale to 4096 later)
+    # Sequence length (2048 for 12GB fit)
     MAX_SEQ_LEN = 2048
     
     # Batch settings (conservative for 12GB)
-    BATCH_SIZE = 1           # Small batch for 4096 seq len
+    BATCH_SIZE = 1           # Small batch for memory
     GRAD_ACCUM = 32          # Effective batch = 32
     
-    # Data limits (None = full dataset)
-    MAX_TRAIN_SAMPLES = None  # ~2.1M examples
-    MAX_EVAL_SAMPLES = 1000
+    # Data limits (None = full dataset ~2.1M)
+    MAX_TRAIN_SAMPLES = None
+    MAX_EVAL_SAMPLES = 500   # Small eval set
     
     # Checkpointing
     SAVE_INTERVAL = 10000    # Every 10k steps
@@ -108,7 +132,7 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
     
-    # Model config (16 experts, 4096 seq len)
+    # Model config
     model_config = esh_scaled()
     model_config.max_seq_len = MAX_SEQ_LEN
     
@@ -120,21 +144,14 @@ def main():
     print(f"  expert_dim: {model_config.expert_dim}")
     print(f"  max_seq_len: {model_config.max_seq_len}")
     
-    # Estimate parameters
-    # With 16 experts, each expert adds: 3 * d_model * expert_dim params
-    # Total MoE params per layer: 16 * 3 * 1024 * 4096 = ~201M
-    # Total MoE params: 16 layers * 201M = ~3.2B just in experts!
-    # But only 1/16 active = ~200M active MoE params
-    
+    # Parameter estimates
     print(f"\nParameter Estimates:")
     base_params = model_config.estimate_params()
-    # Adjust for 16 experts vs 4
     extra_expert_params = (16 - 4) * model_config.n_layers * 3 * model_config.d_model * model_config.expert_dim
     total_params = base_params + extra_expert_params
-    active_params = base_params  # Only 1 expert active
     
     print(f"  Total params (all experts): ~{total_params / 1e9:.2f}B")
-    print(f"  Active params (1 expert): ~{active_params / 1e6:.0f}M")
+    print(f"  Active params (1 expert): ~{base_params / 1e6:.0f}M")
     
     # Create model
     print("\nCreating model...")
@@ -146,42 +163,41 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Data
-    print("\nLoading datasets...")
-    train_dataset = load_tinystories(
-        tokenizer,
-        max_length=MAX_SEQ_LEN,
+    # Data - STREAMING for training (RAM efficient!)
+    print("\nSetting up streaming dataset (RAM efficient)...")
+    train_dataset = StreamingTextDataset(
         split="train",
+        tokenizer=tokenizer,
+        max_length=MAX_SEQ_LEN,
         max_samples=MAX_TRAIN_SAMPLES,
     )
     
-    eval_dataset = load_tinystories(
-        tokenizer,
-        max_length=MAX_SEQ_LEN,
+    # Small eval set (in-memory is fine)
+    eval_dataset = SimpleTextDataset(
         split="validation",
+        tokenizer=tokenizer,
+        max_length=MAX_SEQ_LEN,
         max_samples=MAX_EVAL_SAMPLES,
     )
     
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
+        num_workers=0,  # Streaming doesn't work with multiple workers
         pin_memory=True,
-        drop_last=True,
     )
     
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
     )
     
-    print(f"\nDataset sizes:")
-    print(f"  Train: {len(train_dataset)} examples")
-    print(f"  Eval: {len(eval_dataset)} examples")
+    print(f"\nDataset info:")
+    print(f"  Train: ~{len(train_dataset):,} examples (streaming)")
+    print(f"  Eval: {len(eval_dataset)} examples (in-memory)")
     
     # Training config - NeurIPS schedule
     training_config = TrainingConfig(
@@ -240,7 +256,7 @@ def main():
     print_memory_stats()
     
     # Estimate training time
-    estimated_tok_per_sec = 400  # Conservative for 4096 seq
+    estimated_tok_per_sec = 400
     total_tokens = MAX_STEPS * BATCH_SIZE * GRAD_ACCUM * MAX_SEQ_LEN
     hours = total_tokens / estimated_tok_per_sec / 3600
     
