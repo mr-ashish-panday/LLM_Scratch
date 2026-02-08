@@ -229,8 +229,8 @@ def main():
                         help="Top-p (nucleus) sampling")
     parser.add_argument("--interactive", action="store_true",
                         help="Interactive mode")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device (cuda/cpu)")
+    parser.add_argument("--device", type=str, default="cpu",
+                        help="Device (cuda/cpu) - default CPU to allow testing during training")
     
     args = parser.parse_args()
     
