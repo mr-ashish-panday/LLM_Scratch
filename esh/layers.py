@@ -18,12 +18,20 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 
 # Try to import mamba - falls back gracefully if not installed
+# Prefer Mamba2 (newer) over Mamba (original)
 try:
-    from mamba_ssm import Mamba
+    from mamba_ssm import Mamba2
     MAMBA_AVAILABLE = True
+    MAMBA_VERSION = 2
 except ImportError:
-    MAMBA_AVAILABLE = False
-    print("Warning: mamba-ssm not installed. Using placeholder SSM.")
+    try:
+        from mamba_ssm import Mamba
+        MAMBA_AVAILABLE = True
+        MAMBA_VERSION = 1
+    except ImportError:
+        MAMBA_AVAILABLE = False
+        MAMBA_VERSION = 0
+        print("Warning: mamba-ssm not installed. Using placeholder SSM.")
 
 
 # =============================================================================
@@ -100,9 +108,33 @@ class SoftEntropyRouter(nn.Module):
             return {
                 "alpha_mean": alpha.mean().item(),
                 "alpha_std": alpha.std().item(),
+                "alpha_variance": alpha.var().item(),
                 "attention_ratio": (alpha > 0.5).float().mean().item(),
                 "temperature": self.temperature.item(),
             }
+    
+    def compute_variance_loss(self, alpha: torch.Tensor, target_variance: float = 0.15) -> torch.Tensor:
+        """
+        Variance-Incentive Loss: Encourage decisive routing.
+        
+        Penalizes if α is stuck at constant value (e.g., always 0.5).
+        Encourages bimodal distribution (α → 0 or α → 1).
+        
+        Args:
+            alpha: [batch, seq_len, 1] - routing weights
+            target_variance: Target variance for α (0.25 is max for [0,1])
+            
+        Returns:
+            variance_loss: Scalar penalty
+        """
+        # Current variance of routing decisions
+        current_variance = alpha.var()
+        
+        # Penalize if variance is below target (not decisive enough)
+        # Using squared error to create smooth gradient
+        variance_loss = F.mse_loss(current_variance, torch.tensor(target_variance, device=alpha.device))
+        
+        return variance_loss
 
 
 # =============================================================================
@@ -238,12 +270,22 @@ class SSMLayer(nn.Module):
         self.d_model = d_model
         
         if MAMBA_AVAILABLE:
-            self.ssm = Mamba(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
+            if MAMBA_VERSION == 2:
+                # Mamba2 - newer, more efficient
+                self.ssm = Mamba2(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                )
+            else:
+                # Original Mamba
+                self.ssm = Mamba(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                )
             self.use_mamba = True
         else:
             # Fallback: Gated convolution (not as good, but works)
