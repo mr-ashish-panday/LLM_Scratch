@@ -63,6 +63,7 @@ class RandomRouter(nn.Module):
         else:
             avg_alpha = 0.5
         return {
+            "alpha_mean": avg_alpha,  # Required by training.py
             "attention_ratio": avg_alpha,
             "temperature": 1.0,
             "entropy": 0.0,  # No entropy for random router
