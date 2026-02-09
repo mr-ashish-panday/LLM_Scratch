@@ -46,12 +46,27 @@ class RandomRouter(nn.Module):
         self.d_model = d_model
         # Fixed random baseline α (no learning)
         self.register_buffer('base_alpha', torch.tensor(0.5))
+        # Track last alpha for stats
+        self._last_alpha = None
     
     def forward(self, x: torch.Tensor, **kwargs):
         B, L, D = x.shape
         # Random α per token, uniform [0.3, 0.7] to avoid extremes
         alpha = 0.3 + 0.4 * torch.rand(B, L, 1, device=x.device)
+        self._last_alpha = alpha
         return alpha
+    
+    def get_routing_stats(self, x: torch.Tensor) -> dict:
+        """Return routing statistics (required by ESHBlock)."""
+        if self._last_alpha is not None:
+            avg_alpha = self._last_alpha.mean().item()
+        else:
+            avg_alpha = 0.5
+        return {
+            "attention_ratio": avg_alpha,
+            "temperature": 1.0,
+            "entropy": 0.0,  # No entropy for random router
+        }
 
 
 # =============================================================================
