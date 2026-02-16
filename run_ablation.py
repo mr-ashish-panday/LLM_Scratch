@@ -31,7 +31,7 @@ from transformers import AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from esh_unified.model import UnifiedConfig, UnifiedModel
-from data_loader import create_data_loaders
+from data_loader import create_mixed_dataloader, create_mixed_eval_dataloader
 
 
 def set_deterministic(seed: int = 42):
@@ -155,10 +155,15 @@ def train(args):
     tokenizer.pad_token = tokenizer.eos_token
 
     # Data loaders (mixed complexity: TinyStories + WikiText + GSM8K)
-    train_loader, eval_loader = create_data_loaders(
+    train_loader = create_mixed_dataloader(
         tokenizer=tokenizer,
-        max_length=args.seq_len,
         batch_size=args.batch_size,
+        max_length=args.seq_len,
+    )
+    eval_loader = create_mixed_eval_dataloader(
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        max_length=args.seq_len,
     )
 
     # Optimizer
