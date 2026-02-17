@@ -97,6 +97,8 @@ def parse_args():
     parser.add_argument("--max_ponder", type=int, default=3)
     parser.add_argument("--no-moe", action="store_true",
                         help="Replace MoE with plain SwiGLU (cleaner 2D ablation)")
+    parser.add_argument("--cache-dir", type=str, default=None,
+                        help="Directory to cache datasets locally (offline training)")
 
     return parser.parse_args()
 
@@ -155,15 +157,18 @@ def train(args):
     tokenizer.pad_token = tokenizer.eos_token
 
     # Data loaders (mixed complexity: TinyStories + WikiText + GSM8K)
+    cache_dir = getattr(args, 'cache_dir', None)
     train_loader = create_mixed_dataloader(
         tokenizer=tokenizer,
         batch_size=args.batch_size,
         max_length=args.seq_len,
+        cache_dir=cache_dir,
     )
     eval_loader = create_mixed_eval_dataloader(
         tokenizer=tokenizer,
         batch_size=args.batch_size,
         max_length=args.seq_len,
+        cache_dir=cache_dir,
     )
 
     # Optimizer

@@ -37,6 +37,7 @@ class MixedComplexityDataset(IterableDataset):
         wiki_ratio: float = 0.20,
         gsm_ratio: float = 0.10,
         seed: int = 42,
+        cache_dir: Optional[str] = None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -45,33 +46,41 @@ class MixedComplexityDataset(IterableDataset):
         self.wiki_ratio = wiki_ratio
         self.gsm_ratio = gsm_ratio
         self.seed = seed
+        self.cache_dir = cache_dir
         
         # Validate ratios
         assert abs(tiny_ratio + wiki_ratio + gsm_ratio - 1.0) < 0.01, \
             "Ratios must sum to 1.0"
         
-        # Load datasets in streaming mode
-        print("Loading TinyStories (streaming)...")
+        # If cache_dir is set, download to disk (works offline after first run)
+        # If cache_dir is None, use streaming (requires constant internet)
+        use_streaming = cache_dir is None
+        mode_str = "streaming" if use_streaming else f"cached → {cache_dir}"
+        
+        print(f"Loading TinyStories ({mode_str})...")
         self.tiny_stories = load_dataset(
             "roneneldan/TinyStories",
             split="train",
-            streaming=True,
+            streaming=use_streaming,
+            cache_dir=cache_dir,
         )
         
-        print("Loading WikiText-103 (streaming)...")
+        print(f"Loading WikiText-103 ({mode_str})...")
         self.wikitext = load_dataset(
             "wikitext",
             "wikitext-103-raw-v1",
             split="train",
-            streaming=True,
+            streaming=use_streaming,
+            cache_dir=cache_dir,
         )
         
-        print("Loading GSM8K (streaming)...")
+        print(f"Loading GSM8K ({mode_str})...")
         self.gsm8k = load_dataset(
             "openai/gsm8k",
             "main",
             split="train",
-            streaming=True,
+            streaming=use_streaming,
+            cache_dir=cache_dir,
         )
         
         print("Mixed dataset ready!")
@@ -160,15 +169,18 @@ class MixedEvalDataset(torch.utils.data.Dataset):
         tokenizer: PreTrainedTokenizer,
         max_length: int = 2048,
         samples_per_source: int = 100,
+        cache_dir: Optional[str] = None,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.examples = []
         
+        use_streaming = cache_dir is None
         print(f"Loading {samples_per_source} eval samples per source...")
         
         # TinyStories
-        tiny = load_dataset("roneneldan/TinyStories", split="validation", streaming=True)
+        tiny = load_dataset("roneneldan/TinyStories", split="validation",
+                           streaming=use_streaming, cache_dir=cache_dir)
         for i, ex in enumerate(tiny):
             if i >= samples_per_source:
                 break
@@ -177,7 +189,8 @@ class MixedEvalDataset(torch.utils.data.Dataset):
                 self.examples.append({"text": text, "source": "tiny"})
         
         # WikiText-103
-        wiki = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation", streaming=True)
+        wiki = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation",
+                           streaming=use_streaming, cache_dir=cache_dir)
         for i, ex in enumerate(wiki):
             if i >= samples_per_source:
                 break
@@ -186,7 +199,8 @@ class MixedEvalDataset(torch.utils.data.Dataset):
                 self.examples.append({"text": text, "source": "wiki"})
         
         # GSM8K (use test split for eval)
-        gsm = load_dataset("openai/gsm8k", "main", split="test", streaming=True)
+        gsm = load_dataset("openai/gsm8k", "main", split="test",
+                          streaming=use_streaming, cache_dir=cache_dir)
         for i, ex in enumerate(gsm):
             if i >= samples_per_source:
                 break
@@ -221,8 +235,13 @@ def create_mixed_dataloader(
     tiny_ratio: float = 0.70,
     wiki_ratio: float = 0.20,
     gsm_ratio: float = 0.10,
+    cache_dir: Optional[str] = None,
 ) -> DataLoader:
-    """Create streaming dataloader for mixed complexity training."""
+    """Create dataloader for mixed complexity training.
+    
+    If cache_dir is set, datasets are downloaded to disk and loaded locally
+    (works offline after first download). Otherwise uses streaming.
+    """
     
     dataset = MixedComplexityDataset(
         tokenizer=tokenizer,
@@ -230,6 +249,7 @@ def create_mixed_dataloader(
         tiny_ratio=tiny_ratio,
         wiki_ratio=wiki_ratio,
         gsm_ratio=gsm_ratio,
+        cache_dir=cache_dir,
     )
     
     def collate_fn(batch):
@@ -248,7 +268,7 @@ def create_mixed_dataloader(
         dataset,
         batch_size=batch_size,
         collate_fn=collate_fn,
-        num_workers=0,  # Streaming doesn't support multiprocessing
+        num_workers=0,
     )
 
 
@@ -257,6 +277,7 @@ def create_mixed_eval_dataloader(
     batch_size: int = 4,
     max_length: int = 2048,
     samples_per_source: int = 100,
+    cache_dir: Optional[str] = None,
 ) -> DataLoader:
     """Create eval dataloader with samples from each source."""
     
@@ -264,6 +285,7 @@ def create_mixed_eval_dataloader(
         tokenizer=tokenizer,
         max_length=max_length,
         samples_per_source=samples_per_source,
+        cache_dir=cache_dir,
     )
     
     def collate_fn(batch):
