@@ -198,13 +198,12 @@ class UnifiedBlock(nn.Module):
         # per-token halted probability (how much prob mass has been "spent")
         halted_prob = torch.zeros(B, L, 1, device=device, dtype=x.dtype)
         current = x
-        n_updates = torch.zeros(B, L, 1, device=device, dtype=x.dtype)
 
         all_alphas = []
-        actual_steps = 0
+        # Track remainders for DIFFERENTIABLE ponder cost
+        remainders = []
 
         for step in range(self.max_ponder_steps):
-            actual_steps = step + 1
             # Route
             router_out = self.router(
                 current, ponder_step=step, max_steps=self.max_ponder_steps,
@@ -230,8 +229,9 @@ class UnifiedBlock(nn.Module):
 
             total_aux_loss = total_aux_loss + moe_loss
 
-            # Remaining probability for this token
+            # Remaining probability for this token (DIFFERENTIABLE through halt_prob)
             remainder = 1.0 - halted_prob
+            remainders.append(remainder)
 
             # ACT accumulation
             if step < self.max_ponder_steps - 1:
@@ -243,7 +243,6 @@ class UnifiedBlock(nn.Module):
 
             accumulated = accumulated + weight * step_output
             halted_prob = halted_prob + weight
-            n_updates = n_updates + 1.0
 
             # Update current for next step
             current = step_output
@@ -253,13 +252,21 @@ class UnifiedBlock(nn.Module):
                 break
 
         # =====================================================================
-        # Ponder cost: DIRECTLY penalize using more steps
-        # n_updates / max_steps gives a differentiable signal:
-        #   1 step  → 1/3 = 0.33 (cheap, good)
-        #   3 steps → 3/3 = 1.00 (expensive, penalized)
-        # This replaces the old broken formula that was ~0 everywhere.
+        # Ponder cost: SUM OF REMAINDERS (differentiable!)
+        #
+        # remainder_t = 1 - halted_prob_t, which depends on halt_prob (sigmoid)
+        # so gradient FLOWS through this cost.
+        #
+        # If halt_prob_0 is high → remainder_1 is low → cost is low (good)
+        # If halt_prob is always low → all remainders are high → cost is high
+        #
+        # Normalized by max_steps so cost is in [0.33, 1.0] for 3 steps:
+        #   1 step:  remainder_0=1.0, ~0.33
+        #   3 steps: all remainders~1.0, ~1.0
+        #
+        # OLD BUG: n_updates was a discrete counter with ZERO gradient.
         # =====================================================================
-        ponder_cost = (n_updates / self.max_ponder_steps).mean()
+        ponder_cost = torch.stack(remainders).mean(dim=0).mean() / self.max_ponder_steps * len(remainders)
 
         # Alpha balance losses (two components):
         #
@@ -292,7 +299,7 @@ class UnifiedBlock(nn.Module):
                     "alpha_mean": avg_alpha.item(),
                     "alpha_std": stacked_alpha[:, :, 0].std().item(),
                     "attention_ratio": (stacked_alpha[:, :, 0] > 0.5).float().mean().item(),
-                    "avg_ponder_steps": n_updates.mean().item(),
+                    "avg_ponder_steps": float(len(remainders)),
                     "halt_prob_mean": halted_prob.mean().item(),
                     "alpha_balance_loss": alpha_balance_loss.item() if torch.is_tensor(alpha_balance_loss) else 0.0,
                 }
