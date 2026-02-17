@@ -117,7 +117,7 @@ def get_config(args) -> UnifiedConfig:
         enable_width_routing=width,
         enable_depth_routing=depth,
         max_ponder_steps=args.max_ponder,
-        ponder_cost_weight=0.03,
+        ponder_cost_weight=0.5,  # Was 0.03 — far too weak. Need strong penalty.
         use_moe=not getattr(args, 'no_moe', False),
     )
 
@@ -234,12 +234,12 @@ def train(args):
             ponder_cost = outputs["ponder_cost"]
 
             # Ponder cost warmup (for depth modes):
-            # Steps 0-5K: no ponder cost
-            # Steps 5K-15K: ramp up
-            # Steps 15K+: full cost
+            # Steps 0-1K: no ponder cost (let model learn basics)
+            # Steps 1K-5K: ramp up (force efficient halting)
+            # Steps 5K+: full cost
             if config.enable_depth_routing:
-                warmup_start = 5000
-                warmup_end = 15000
+                warmup_start = 1000
+                warmup_end = 5000
                 if global_step < warmup_start:
                     ponder_scale = 0.0
                 elif global_step < warmup_end:

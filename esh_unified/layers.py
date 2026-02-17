@@ -195,15 +195,16 @@ class UnifiedBlock(nn.Module):
         # DEPTH ROUTING: Adaptive pondering loop (depth_only or unified)
         # =====================================================================
         accumulated = torch.zeros_like(x)
-        # per-token remainder probability
-        remainder = torch.ones(B, L, 1, device=device, dtype=x.dtype)
+        # per-token halted probability (how much prob mass has been "spent")
+        halted_prob = torch.zeros(B, L, 1, device=device, dtype=x.dtype)
         current = x
-        ponder_steps_tracker = torch.zeros(B, L, 1, device=device, dtype=x.dtype)
-        total_ponder_prob = torch.zeros(B, L, 1, device=device, dtype=x.dtype)
+        n_updates = torch.zeros(B, L, 1, device=device, dtype=x.dtype)
 
         all_alphas = []
+        actual_steps = 0
 
         for step in range(self.max_ponder_steps):
+            actual_steps = step + 1
             # Route
             router_out = self.router(
                 current, ponder_step=step, max_steps=self.max_ponder_steps,
@@ -229,30 +230,45 @@ class UnifiedBlock(nn.Module):
 
             total_aux_loss = total_aux_loss + moe_loss
 
+            # Remaining probability for this token
+            remainder = 1.0 - halted_prob
+
             # ACT accumulation
             if step < self.max_ponder_steps - 1:
-                # Normal step: use halt_prob * remainder as weight
+                # Normal step: halt_prob determines how much to commit
                 weight = halt_prob * remainder
             else:
-                # Last step: use all remaining probability
+                # Last step: dump all remaining probability
                 weight = remainder
 
             accumulated = accumulated + weight * step_output
-            remainder = remainder - weight
-            ponder_steps_tracker = ponder_steps_tracker + 1.0
-            total_ponder_prob = total_ponder_prob + halt_prob
+            halted_prob = halted_prob + weight
+            n_updates = n_updates + 1.0
 
             # Update current for next step
             current = step_output
 
-            # Early exit if all tokens have halted
-            if (remainder < (1 - self.halt_threshold)).all():
+            # Early exit if all tokens have halted (>threshold committed)
+            if (halted_prob > self.halt_threshold).all():
                 break
 
-        # Ponder cost: encourage efficiency (penalize extra steps)
-        # This is the mean of (1 - halt_prob) summed over steps — measures
-        # how much "undecided" probability the model used
-        ponder_cost = (1.0 - total_ponder_prob / ponder_steps_tracker).mean()
+        # =====================================================================
+        # Ponder cost: DIRECTLY penalize using more steps
+        # n_updates / max_steps gives a differentiable signal:
+        #   1 step  → 1/3 = 0.33 (cheap, good)
+        #   3 steps → 3/3 = 1.00 (expensive, penalized)
+        # This replaces the old broken formula that was ~0 everywhere.
+        # =====================================================================
+        ponder_cost = (n_updates / self.max_ponder_steps).mean()
+
+        # Alpha balance loss: penalize α deviating too far from 0.5
+        # This prevents the router from collapsing to SSM-only or Attn-only.
+        # L_balance = (α - 0.5)^2, pushing toward using both paths.
+        alpha_balance_loss = torch.tensor(0.0, device=device)
+        if self.enable_width_routing and all_alphas:
+            stacked_alpha = torch.cat(all_alphas, dim=-1)
+            alpha_balance_loss = ((stacked_alpha - 0.5) ** 2).mean()
+            total_aux_loss = total_aux_loss + 0.1 * alpha_balance_loss
 
         stats = {}
         if return_routing_stats:
@@ -263,8 +279,9 @@ class UnifiedBlock(nn.Module):
                     "alpha_mean": avg_alpha.item(),
                     "alpha_std": stacked_alpha[:, :, 0].std().item(),
                     "attention_ratio": (stacked_alpha[:, :, 0] > 0.5).float().mean().item(),
-                    "avg_ponder_steps": ponder_steps_tracker.mean().item(),
-                    "halt_prob_mean": total_ponder_prob.mean().item() / ponder_steps_tracker.mean().item(),
+                    "avg_ponder_steps": n_updates.mean().item(),
+                    "halt_prob_mean": halted_prob.mean().item(),
+                    "alpha_balance_loss": alpha_balance_loss.item() if torch.is_tensor(alpha_balance_loss) else 0.0,
                 }
 
         return accumulated, total_aux_loss, ponder_cost, stats
