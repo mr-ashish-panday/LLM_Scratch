@@ -261,14 +261,27 @@ class UnifiedBlock(nn.Module):
         # =====================================================================
         ponder_cost = (n_updates / self.max_ponder_steps).mean()
 
-        # Alpha balance loss: penalize α deviating too far from 0.5
-        # This prevents the router from collapsing to SSM-only or Attn-only.
-        # L_balance = (α - 0.5)^2, pushing toward using both paths.
+        # Alpha balance losses (two components):
+        #
+        # 1. L_mean = (α.mean() - 0.5)²
+        #    Penalizes the BATCH mean deviating from 0.5.
+        #    Allows individual tokens to be 0.1 or 0.9 as long as
+        #    the macro-level usage of SSM vs Attention is balanced.
+        #
+        # 2. L_var = clamp(0.15 - α.var(), min=0)
+        #    ENCOURAGES high variance — forces the router to make
+        #    decisive, polarized choices (not mushy 0.5 for everything).
+        #
+        # NOTE: The old formula ((α-0.5)²).mean() was wrong because it
+        # penalized each token individually, forcing ALL tokens to 0.5
+        # and destroying the routing entirely.
         alpha_balance_loss = torch.tensor(0.0, device=device)
         if self.enable_width_routing and all_alphas:
             stacked_alpha = torch.cat(all_alphas, dim=-1)
-            alpha_balance_loss = ((stacked_alpha - 0.5) ** 2).mean()
-            total_aux_loss = total_aux_loss + 0.1 * alpha_balance_loss
+            alpha_mean_loss = (stacked_alpha.mean() - 0.5) ** 2
+            alpha_var_loss = torch.clamp(0.15 - stacked_alpha.var(), min=0.0)
+            alpha_balance_loss = alpha_mean_loss + alpha_var_loss
+            total_aux_loss = total_aux_loss + 0.1 * alpha_mean_loss + 0.1 * alpha_var_loss
 
         stats = {}
         if return_routing_stats:
