@@ -288,7 +288,8 @@ class UnifiedBlock(nn.Module):
             alpha_mean_loss = (stacked_alpha.mean() - 0.5) ** 2
             alpha_var_loss = torch.clamp(0.15 - stacked_alpha.var(), min=0.0)
             alpha_balance_loss = alpha_mean_loss + alpha_var_loss
-            total_aux_loss = total_aux_loss + 0.1 * alpha_mean_loss + 0.1 * alpha_var_loss
+            alpha_balance_loss = alpha_mean_loss + alpha_var_loss
+            total_aux_loss = total_aux_loss + 1.0 * alpha_mean_loss + 1.0 * alpha_var_loss
 
         stats = {}
         if return_routing_stats:
@@ -299,7 +300,7 @@ class UnifiedBlock(nn.Module):
                     "alpha_mean": avg_alpha.item(),
                     "alpha_std": stacked_alpha[:, :, 0].std().item(),
                     "attention_ratio": (stacked_alpha[:, :, 0] > 0.5).float().mean().item(),
-                    "avg_ponder_steps": float(len(remainders)),
+                    "avg_ponder_steps": torch.stack(remainders).sum(dim=0).mean().item(),
                     "halt_prob_mean": halted_prob.mean().item(),
                     "alpha_balance_loss": alpha_balance_loss.item() if torch.is_tensor(alpha_balance_loss) else 0.0,
                 }
