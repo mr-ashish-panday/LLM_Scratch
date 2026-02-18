@@ -296,13 +296,20 @@ class UnifiedBlock(nn.Module):
             with torch.no_grad():
                 stacked_alpha = torch.cat(all_alphas, dim=-1)  # [B, L, steps]
                 avg_alpha = stacked_alpha.mean()
+                # Per-token ponder steps: sum of remainders across steps → [B, L, 1]
+                per_token_ponder = torch.stack(remainders).sum(dim=0).squeeze(-1)  # [B, L]
+                # Per-token alpha: average across ponder steps → [B, L]
+                per_token_alpha = stacked_alpha.mean(dim=-1)  # [B, L]
                 stats = {
                     "alpha_mean": avg_alpha.item(),
                     "alpha_std": stacked_alpha[:, :, 0].std().item(),
                     "attention_ratio": (stacked_alpha[:, :, 0] > 0.5).float().mean().item(),
-                    "avg_ponder_steps": torch.stack(remainders).sum(dim=0).mean().item(),
+                    "avg_ponder_steps": per_token_ponder.mean().item(),
                     "halt_prob_mean": halted_prob.mean().item(),
                     "alpha_balance_loss": alpha_balance_loss.item() if torch.is_tensor(alpha_balance_loss) else 0.0,
+                    # Per-token data for entropy analysis (detached, cpu)
+                    "per_token_ponder": per_token_ponder.cpu(),  # [B, L]
+                    "per_token_alpha": per_token_alpha.cpu(),  # [B, L]
                 }
 
         return accumulated, total_aux_loss, ponder_cost, stats
