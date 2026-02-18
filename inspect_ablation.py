@@ -40,7 +40,7 @@ def inspect(mode):
     loader = create_mixed_eval_dataloader(tokenizer, batch_size=4, max_length=512, cache_dir="./data_cache")
     
     batch = next(iter(loader))
-    input_ids = batch["input_ids"].to(model.device)
+    input_ids = batch["input_ids"].to(next(model.parameters()).device)
 
     print(f"[{mode}] Running inference on 1 batch...")
     with torch.no_grad():
