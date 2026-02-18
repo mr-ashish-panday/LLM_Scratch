@@ -233,6 +233,7 @@ def train(args):
 
         # Forward
         with autocast(enabled=use_amp):
+            model.set_global_step(global_step)  # For burn-in logic
             outputs = model(input_ids, labels=input_ids, return_routing_stats=True)
             loss = outputs["loss"]
             aux_loss = outputs["aux_loss"]

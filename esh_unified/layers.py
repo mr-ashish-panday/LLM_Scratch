@@ -76,6 +76,8 @@ class UnifiedBlock(nn.Module):
         self.enable_depth_routing = enable_depth_routing
         self.max_ponder_steps = max_ponder_steps
         self.halt_threshold = halt_threshold
+        self._global_step = 99999  # Set by model before forward
+        self.burn_in_steps = 1500  # Force α=0.5 during burn-in
 
         # Normalization
         self.norm1 = RMSNorm(d_model)
@@ -163,7 +165,11 @@ class UnifiedBlock(nn.Module):
             router_out = self.router(x, ponder_step=0, max_steps=1,
                                      training=self.training)
             if self.enable_width_routing:
-                alpha = router_out.alpha  # [B, L, 1] learned
+                # BURN-IN: Force α=0.5 for first N steps
+                if self._global_step < self.burn_in_steps:
+                    alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
+                else:
+                    alpha = router_out.alpha  # [B, L, 1] learned
             else:
                 alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
 
@@ -211,7 +217,11 @@ class UnifiedBlock(nn.Module):
             )
 
             if self.enable_width_routing:
-                alpha = router_out.alpha
+                # BURN-IN: Force α=0.5 for first N steps
+                if self._global_step < self.burn_in_steps:
+                    alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
+                else:
+                    alpha = router_out.alpha
             else:
                 alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
 
@@ -283,11 +293,11 @@ class UnifiedBlock(nn.Module):
         # penalized each token individually, forcing ALL tokens to 0.5
         # and destroying the routing entirely.
         alpha_balance_loss = torch.tensor(0.0, device=device)
-        if self.enable_width_routing and all_alphas:
+        if self.enable_width_routing and all_alphas and self._global_step >= self.burn_in_steps:
+            # Only apply alpha balance after burn-in (during burn-in, α is forced to 0.5)
             stacked_alpha = torch.cat(all_alphas, dim=-1)
             alpha_mean_loss = (stacked_alpha.mean() - 0.5) ** 2
             alpha_var_loss = torch.clamp(0.15 - stacked_alpha.var(), min=0.0)
-            alpha_balance_loss = alpha_mean_loss + alpha_var_loss
             alpha_balance_loss = alpha_mean_loss + alpha_var_loss
             total_aux_loss = total_aux_loss + 1.0 * alpha_mean_loss + 1.0 * alpha_var_loss
 

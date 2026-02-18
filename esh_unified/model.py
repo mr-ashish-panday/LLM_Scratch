@@ -133,6 +133,11 @@ class UnifiedModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=self.config.init_std)
 
+    def set_global_step(self, step: int):
+        """Set training step on all blocks (for burn-in logic)."""
+        for block in self.blocks:
+            block._global_step = step
+
     def forward(
         self,
         input_ids: torch.Tensor,
