@@ -104,11 +104,12 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-steps", type=int, default=3000)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache-dir", type=str, default=None)
+    parser.add_argument("--fast", action="store_true", help="Use smaller model for faster capture")
     args = parser.parse_args()
     
     # Setup
@@ -121,20 +122,38 @@ def main():
     print(f"Device: {device}")
     
     # Width-only config (the mode that shows collapse)
-    config = UnifiedConfig(
-        vocab_size=50257,
-        d_model=768,
-        n_layers=8,
-        n_heads=12,
-        n_experts=4,
-        max_seq_len=512,
-        use_checkpoint=True,
-        enable_width_routing=True,
-        enable_depth_routing=False,  # Width only for clean isolation
-        max_ponder_steps=3,
-        ponder_cost_weight=0.5,
-        use_moe=True,
-    )
+    if args.fast:
+        # Lighter model for faster capture (~4s/step vs ~30s/step)
+        # Routing behavior is the same regardless of model scale
+        config = UnifiedConfig(
+            vocab_size=50257,
+            d_model=512,
+            n_layers=4,
+            n_heads=8,
+            n_experts=4,
+            max_seq_len=256,
+            use_checkpoint=False,
+            enable_width_routing=True,
+            enable_depth_routing=False,
+            max_ponder_steps=3,
+            ponder_cost_weight=0.5,
+            use_moe=True,
+        )
+    else:
+        config = UnifiedConfig(
+            vocab_size=50257,
+            d_model=768,
+            n_layers=8,
+            n_heads=12,
+            n_experts=4,
+            max_seq_len=512,
+            use_checkpoint=True,
+            enable_width_routing=True,
+            enable_depth_routing=False,
+            max_ponder_steps=3,
+            ponder_cost_weight=0.5,
+            use_moe=True,
+        )
     
     print(f"\nBurn-in Capture Run")
     print(f"  Mode: width_only (isolates α collapse)")
@@ -150,8 +169,9 @@ def main():
     # Tokenizer + Data
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+    seq_len = 256 if args.fast else 512
     train_loader = create_mixed_dataloader(
-        tokenizer, batch_size=args.batch_size, max_length=512,
+        tokenizer, batch_size=args.batch_size, max_length=seq_len,
         cache_dir=args.cache_dir,
     )
     
@@ -186,6 +206,10 @@ def main():
             batch = next(data_iter)
         
         input_ids = batch["input_ids"].to(device)
+        
+        # Progress dot every 10 steps (so user knows it's alive)
+        if (step + 1) % 10 == 0 and (step + 1) % args.log_interval != 0:
+            print(f"  ... step {step+1}", flush=True)
         
         # LR schedule
         lr = cosine_lr(step, 1000, args.max_steps, args.lr)
