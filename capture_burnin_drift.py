@@ -195,10 +195,12 @@ def main():
         # Enable hook ONLY on logging step to avoid massive CPU-GPU sync slowdowns
         logit_capture.active = ((step + 1) % args.log_interval == 0)
         
-        # Forward
+        # Forward — only collect routing stats on logging steps to avoid
+        # massive CPU-GPU sync overhead from .item() calls in stats collection
+        is_log_step = ((step + 1) % args.log_interval == 0)
         with autocast(enabled=True):
             model.set_global_step(step)
-            outputs = model(input_ids, labels=input_ids, return_routing_stats=True)
+            outputs = model(input_ids, labels=input_ids, return_routing_stats=is_log_step)
             loss = outputs["loss"]
             aux_loss = outputs["aux_loss"]
             total_loss = loss + aux_loss
