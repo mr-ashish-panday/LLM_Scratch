@@ -168,12 +168,16 @@ class UnifiedBlock(nn.Module):
                 # BURN-IN: Force α=0.5 for first N steps
                 if self._global_step < self.burn_in_steps:
                     alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
+                    # CRITICAL: Zero out router aux_loss during burn-in.
+                    # The router's alpha output is overridden, so aux_loss
+                    # (variance, balance, z-loss) trains the router in a vacuum
+                    # with no connection to the actual language modeling task.
+                    # This was the ROOT CAUSE of the pathway collapse bug.
                 else:
                     alpha = router_out.alpha  # [B, L, 1] learned
+                    total_aux_loss = total_aux_loss + router_out.aux_loss
             else:
                 alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
-
-            total_aux_loss = total_aux_loss + router_out.aux_loss
 
             if self.use_checkpoint and self.training:
                 output, moe_loss = checkpoint(
@@ -220,13 +224,15 @@ class UnifiedBlock(nn.Module):
                 # BURN-IN: Force α=0.5 for first N steps
                 if self._global_step < self.burn_in_steps:
                     alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
+                    # CRITICAL: Zero out router aux_loss during burn-in.
+                    # Same fix as the non-depth path above.
                 else:
                     alpha = router_out.alpha
+                    total_aux_loss = total_aux_loss + router_out.aux_loss
             else:
                 alpha = torch.full((B, L, 1), 0.5, device=device, dtype=x.dtype)
 
             halt_prob = router_out.halt_prob  # [B, L, 1]
-            total_aux_loss = total_aux_loss + router_out.aux_loss
             all_alphas.append(alpha.detach())
 
             # Process step
