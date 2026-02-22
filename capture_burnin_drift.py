@@ -34,38 +34,58 @@ from esh_unified.model import UnifiedConfig, UnifiedModel
 from data_loader import create_mixed_dataloader
 
 
-def extract_router_logits_inline(model):
-    """Extract current pre-sigmoid logits from each layer's router complexity_net weights.
+class RouterLogitCapture:
+    """Uses forward hooks to capture pre-sigmoid router logits on REAL data.
     
-    Returns the mean bias of the router — a proxy for its internal preference.
-    Negative = SSM preferred, Positive = Attention preferred.
+    The previous version fed random noise to the router, which always produced
+    near-zero logits (since complexity_net has no bias). This version hooks into
+    the actual forward pass and records real logits.
     """
-    logits_info = []
-    for i, block in enumerate(model.blocks):
-        router = block.router
-        # Get the weight norms and biases of the complexity net
-        # Layer 0: Linear(768, 192, bias=False) + SiLU + Linear(192, 1, bias=False)
-        w1 = router.complexity_net[0].weight  # [192, 768]
-        w2 = router.complexity_net[2].weight  # [1, 192]
-        
-        # The effective "bias" toward SSM or Attention can be estimated from
-        # the product of weight matrices evaluated at a zero-centered input.
-        # More practically: check the output on a unit-scale random input.
-        with torch.no_grad():
-            test_input = torch.randn(1, 32, model.config.d_model, device=w1.device) * 0.1
-            raw_logits = router.complexity_net(test_input)  # [1, 32, 1]
-            mean_logit = raw_logits.mean().item()
-            std_logit = raw_logits.std().item()
-            desired_alpha = torch.sigmoid(raw_logits).mean().item()
-        
-        logits_info.append({
-            "layer": i,
-            "mean_logit": mean_logit,
-            "std_logit": std_logit,
-            "desired_alpha": desired_alpha,
-        })
     
-    return logits_info
+    def __init__(self, model):
+        self.model = model
+        self.captured_logits = []
+        self._hooks = []
+    
+    def _make_hook(self, layer_idx):
+        """Create a hook that captures pre-sigmoid logits from the router."""
+        def hook_fn(module, args, output):
+            # output is a RouterOutput(alpha, halt_prob, aux_loss, entropy)
+            # We need the pre-sigmoid logits. Re-compute from the input.
+            x = args[0]  # [B, L, D] — the actual hidden representation
+            with torch.no_grad():
+                raw_logits = module.complexity_net(x)  # [B, L, 1]
+                temperature = torch.exp(module.log_temperature).clamp(0.1, 10.0)
+                scaled_logits = raw_logits / temperature
+                
+                self.captured_logits.append({
+                    "layer": layer_idx,
+                    "mean_logit": scaled_logits.mean().item(),
+                    "std_logit": scaled_logits.std().item(),
+                    "min_logit": scaled_logits.min().item(),
+                    "max_logit": scaled_logits.max().item(),
+                    "desired_alpha": torch.sigmoid(scaled_logits).mean().item(),
+                    "temperature": temperature.item(),
+                })
+        return hook_fn
+    
+    def attach(self):
+        """Attach hooks to all layer routers."""
+        for i, block in enumerate(self.model.blocks):
+            h = block.router.register_forward_hook(self._make_hook(i))
+            self._hooks.append(h)
+    
+    def detach(self):
+        """Remove all hooks."""
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+    
+    def get_and_clear(self):
+        """Return captured logits and clear the buffer."""
+        result = list(self.captured_logits)
+        self.captured_logits.clear()
+        return result
 
 
 def cosine_lr(step, warmup, max_steps, max_lr, min_lr=1e-5):
@@ -142,6 +162,10 @@ def main():
     data_iter = iter(train_loader)
     trajectory = []  # The main output: logit trajectory across training
     
+    # Hook-based capture (uses REAL data, not random noise)
+    logit_capture = RouterLogitCapture(model)
+    logit_capture.attach()
+    
     print(f"\n{'='*70}")
     print(f"  {'Step':>6} | {'Loss':>7} | {'Output α':>9} | {'Router Logit':>13} | {'Desired α':>10} | {'Phase'}")
     print(f"{'='*70}")
@@ -181,10 +205,14 @@ def main():
         
         # Log at every interval
         if (step + 1) % args.log_interval == 0:
-            # Extract raw router logits (the key data)
-            logits_info = extract_router_logits_inline(model)
-            avg_logit = np.mean([l["mean_logit"] for l in logits_info])
-            avg_desired_alpha = np.mean([l["desired_alpha"] for l in logits_info])
+            # Get router logits captured via hooks during THIS forward pass
+            logits_info = logit_capture.get_and_clear()
+            if logits_info:
+                avg_logit = np.mean([l["mean_logit"] for l in logits_info])
+                avg_desired_alpha = np.mean([l["desired_alpha"] for l in logits_info])
+            else:
+                avg_logit = 0.0
+                avg_desired_alpha = 0.5
             
             # Get the actual output alpha from routing stats
             stats = outputs["routing_stats"]
@@ -214,6 +242,9 @@ def main():
                 f"  {step+1:>6} | {loss.item():>7.4f} | {output_alpha:>9.4f} | "
                 f"{avg_logit:>+13.4f} | {avg_desired_alpha:>10.4f} | {phase}"
             )
+        else:
+            # Clear hooks buffer for non-logged steps to avoid memory leak
+            logit_capture.get_and_clear()
     
     elapsed = time.time() - t0
     print(f"\n{'='*70}")

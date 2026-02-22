@@ -117,9 +117,13 @@ class UnifiedEntropyRouter(nn.Module):
             var_loss = (alpha_variance - target_variance).pow(2)
             
             # B) Balance Loss: Prevent collapse to all-SSM or all-Attention
-            # Target mean alpha = 0.25 (25% attention, efficient)
+            # Target mean alpha = 0.5 (balanced routing)
+            # NOTE: Previously was 0.25, which CONFLICTED with layers.py
+            # alpha_balance_loss (target=0.5). During burn-in, only this loss
+            # was active, pre-training the router toward SSM (α=0.25).
+            # This conflict was the ROOT CAUSE of the observed pathway collapse.
             mean_alpha = alpha.mean()
-            target_mean = 0.25
+            target_mean = 0.5
             bal_loss = (mean_alpha - target_mean).abs()
             
             # C) Z-Loss: Prevent logits from exploding
