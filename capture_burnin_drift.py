@@ -46,10 +46,15 @@ class RouterLogitCapture:
         self.model = model
         self.captured_logits = []
         self._hooks = []
+        self.active = False
+
     
     def _make_hook(self, layer_idx):
         """Create a hook that captures pre-sigmoid logits from the router."""
         def hook_fn(module, args, output):
+            if not self.active:
+                return
+                
             # output is a RouterOutput(alpha, halt_prob, aux_loss, entropy)
             # We need the pre-sigmoid logits. Re-compute from the input.
             x = args[0]  # [B, L, D] — the actual hidden representation
@@ -186,6 +191,9 @@ def main():
         lr = cosine_lr(step, 1000, args.max_steps, args.lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
+        
+        # Enable hook ONLY on logging step to avoid massive CPU-GPU sync slowdowns
+        logit_capture.active = ((step + 1) % args.log_interval == 0)
         
         # Forward
         with autocast(enabled=True):
