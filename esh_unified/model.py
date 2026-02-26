@@ -132,7 +132,7 @@ class UnifiedModel(nn.Module):
 
         # Final norm and LM head
         self.final_norm = RMSNorm(config.d_model)
-        self.lm_head = nn.Linear(config.vocab_size, config.d_model, bias=False)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Initialize
         self.apply(self._init_weights)

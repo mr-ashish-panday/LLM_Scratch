@@ -72,11 +72,11 @@ def estimate_flops_per_token(config: UnifiedConfig, avg_ponder_steps: float) -> 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ESH Width × Depth Ablation")
+    parser = argparse.ArgumentParser(description="ESH v2 Hard Routing Ablation")
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["baseline", "width_only", "depth_only", "unified"],
-        help="Ablation mode"
+        choices=["baseline", "width_only", "compare"],
+        help="Ablation mode (depth routing disabled — ACT+SSM collision)"
     )
     parser.add_argument("--max_steps", type=int, default=25000)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -89,24 +89,30 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="RNG seed (same for all modes)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
 
-    # Model size (kept small for ablation; same across all modes)
+    # Model size
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=12)
     parser.add_argument("--n_experts", type=int, default=4)
-    parser.add_argument("--max_ponder", type=int, default=3)
     parser.add_argument("--no-moe", action="store_true",
-                        help="Replace MoE with plain SwiGLU (cleaner 2D ablation)")
+                        help="Replace MoE with plain SwiGLU")
     parser.add_argument("--cache-dir", type=str, default=None,
-                        help="Directory to cache datasets locally (offline training)")
+                        help="Directory to cache datasets locally")
+
+    # Hard routing params
+    parser.add_argument("--lambda-cost", type=float, default=0.005,
+                        help="Compute penalty weight (tax on Attention)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Gumbel-Softmax temperature")
+    parser.add_argument("--penalty-warmup", type=int, default=2000,
+                        help="Steps before enabling compute penalty")
 
     return parser.parse_args()
 
 
 def get_config(args) -> UnifiedConfig:
     """Create config based on ablation mode."""
-    width = args.mode in ("width_only", "unified")
-    depth = args.mode in ("depth_only", "unified")
+    width = args.mode == "width_only"
 
     return UnifiedConfig(
         vocab_size=50257,
@@ -117,9 +123,10 @@ def get_config(args) -> UnifiedConfig:
         max_seq_len=args.seq_len,
         use_checkpoint=True,
         enable_width_routing=width,
-        enable_depth_routing=depth,
-        max_ponder_steps=args.max_ponder,
-        ponder_cost_weight=0.5,  # Was 0.03 — far too weak. Need strong penalty.
+        enable_depth_routing=False,  # Disabled (ACT+SSM collision)
+        max_ponder_steps=1,
+        compute_penalty_weight=args.lambda_cost,
+        router_temperature=args.temperature,
         use_moe=not getattr(args, 'no_moe', False),
     )
 
@@ -232,32 +239,23 @@ def train(args):
             pg["lr"] = lr
 
         # Forward
+        is_log_step = (global_step + 1) % args.log_interval == 0
         with autocast(enabled=use_amp):
-            model.set_global_step(global_step)  # For burn-in logic
-            outputs = model(input_ids, labels=input_ids, return_routing_stats=True)
-            loss = outputs["loss"]
+            outputs = model(input_ids, labels=input_ids, return_routing_stats=is_log_step)
+            lm_loss = outputs["loss"]
             aux_loss = outputs["aux_loss"]
-            ponder_cost = outputs["ponder_cost"]
+            compute_penalty = outputs["compute_penalty"]
 
-            # Ponder cost warmup (for depth modes):
-            # Steps 0-1K: no ponder cost (let model learn basics)
-            # Steps 1K-5K: ramp up (force efficient halting)
-            # Steps 5K+: full cost
-            if config.enable_depth_routing:
-                warmup_start = 1000
-                warmup_end = 5000
-                if global_step < warmup_start:
-                    ponder_scale = 0.0
-                elif global_step < warmup_end:
-                    ponder_scale = (global_step - warmup_start) / (warmup_end - warmup_start)
-                else:
-                    ponder_scale = 1.0
-                ponder_loss = ponder_scale * config.ponder_cost_weight * ponder_cost
+            # Compute penalty warmup:
+            # Steps 0-N: λ=0 (let model discover routing)
+            # Steps N+: λ=configured (add economic incentive)
+            penalty_warmup = getattr(args, 'penalty_warmup', 2000)
+            if global_step < penalty_warmup:
+                lambda_eff = 0.0
             else:
-                ponder_loss = 0.0
+                lambda_eff = config.compute_penalty_weight
 
-            total_loss = loss + aux_loss + ponder_loss
-            total_loss = total_loss / args.grad_accum
+            total_loss = (lm_loss + aux_loss + lambda_eff * compute_penalty) / args.grad_accum
 
         # Backward
         scaler.scale(total_loss).backward()
@@ -272,27 +270,19 @@ def train(args):
 
         # Collect metrics
         step_metrics = {
-            "loss": loss.item(),
-            "ppl": math.exp(min(loss.item(), 20)),
+            "loss": lm_loss.item(),
+            "ppl": math.exp(min(lm_loss.item(), 20)),
             "aux_loss": aux_loss.item() if torch.is_tensor(aux_loss) else float(aux_loss),
-            "ponder_cost": float(ponder_cost) if isinstance(ponder_cost, (int, float)) else ponder_cost.item() if hasattr(ponder_cost, 'item') else float(ponder_cost),
-            "avg_ponder_steps": outputs["avg_ponder_steps"],
+            "compute_penalty": compute_penalty.item() if torch.is_tensor(compute_penalty) else float(compute_penalty),
+            "lambda_eff": lambda_eff,
         }
 
         # Add routing stats
         if outputs["routing_stats"]:
-            alpha_means = [s.get("alpha_mean", 0.5) for s in outputs["routing_stats"]]
-            attn_ratios = [s.get("attention_ratio", 0.5) for s in outputs["routing_stats"]]
-            ponder_steps = [s.get("avg_ponder_steps", 1.0) for s in outputs["routing_stats"]]
-            step_metrics["alpha_mean"] = sum(alpha_means) / len(alpha_means)
-            step_metrics["attention_ratio"] = sum(attn_ratios) / len(attn_ratios)
-            step_metrics["detail_ponder"] = sum(ponder_steps) / len(ponder_steps)
-
-            # Dynamic FLOP estimation
-            avg_p = step_metrics["detail_ponder"]
-            flops_per_tok = estimate_flops_per_token(config, avg_p)
-            step_metrics["flops_per_token"] = flops_per_tok
-            step_metrics["flop_multiplier"] = avg_p  # vs baseline (1.0 step)
+            attn_ratios = [s.get("attn_ratio", 0.5) for s in outputs["routing_stats"]]
+            ssm_ratios = [s.get("ssm_ratio", 0.5) for s in outputs["routing_stats"]]
+            step_metrics["attn_ratio"] = sum(attn_ratios) / len(attn_ratios)
+            step_metrics["ssm_ratio"] = sum(ssm_ratios) / len(ssm_ratios)
 
         for k, v in step_metrics.items():
             accum_metrics[k] = accum_metrics.get(k, 0) + v
@@ -319,19 +309,20 @@ def train(args):
             }
             metrics_log.append(log_entry)
 
-            alpha_str = f"α={avg.get('alpha_mean', 0.5):.3f}" if config.enable_width_routing else "α=0.500"
-            ponder_str = f"Ponder={avg.get('detail_ponder', 1.0):.2f}" if config.enable_depth_routing else "Ponder=1.00"
+            attn_pct = avg.get('attn_ratio', 0.5) * 100
+            ssm_pct = avg.get('ssm_ratio', 0.5) * 100
+            phase = "PEN" if avg.get('lambda_eff', 0) > 0 else "FREE"
 
             print(
                 f"[{config.mode.upper():>11}] "
                 f"Step {global_step:>6d} | "
                 f"Loss {avg['loss']:.4f} | "
                 f"PPL {ppl:.2f} | "
-                f"{alpha_str} | "
-                f"Attn% {avg.get('attention_ratio', 0.5) * 100:.1f} | "
-                f"{ponder_str} | "
+                f"Attn {attn_pct:.1f}% | "
+                f"SSM {ssm_pct:.1f}% | "
+                f"λ={avg.get('lambda_eff', 0):.3f} | "
                 f"LR {lr:.2e} | "
-                f"Tok/s {tok_sec:.0f}"
+                f"Tok/s {tok_sec:.0f} [{phase}]"
             )
 
         # Save checkpoint
@@ -364,8 +355,7 @@ def train(args):
         "best_ppl": best_ppl,
         "final_loss": metrics_log[-1]["loss"] if metrics_log else None,
         "final_ppl": metrics_log[-1]["ppl"] if metrics_log else None,
-        "final_alpha_mean": metrics_log[-1].get("alpha_mean", 0.5) if metrics_log else None,
-        "final_avg_ponder": metrics_log[-1].get("detail_ponder", 1.0) if metrics_log else None,
+        "final_attn_ratio": metrics_log[-1].get("attn_ratio", 0.5) if metrics_log else None,
         "total_time_hours": elapsed / 3600,
         "params_M": model.count_parameters() / 1e6,
     }
@@ -389,8 +379,7 @@ def train(args):
     print(f"{'='*60}")
     print(f"  Best PPL:       {best_ppl:.4f}")
     print(f"  Final Loss:     {final_metrics['final_loss']:.4f}")
-    print(f"  Final α mean:   {final_metrics['final_alpha_mean']:.3f}")
-    print(f"  Avg Ponder:     {final_metrics['final_avg_ponder']:.2f}")
+    print(f"  Final Attn%:    {final_metrics['final_attn_ratio']*100:.1f}%")
     print(f"  Training Time:  {elapsed / 3600:.2f} hours")
     print(f"  Results saved:  {results_dir}/")
     print(f"{'='*60}")
