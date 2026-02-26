@@ -17,8 +17,8 @@ from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-# Try to import mamba - falls back gracefully if not installed
-# Prefer Mamba2 (newer) over Mamba (original)
+# Try to import mamba - falls back to pure-PyTorch MambaMinimal
+# Priority: Mamba2 (CUDA) > Mamba (CUDA) > MambaMinimal (pure PyTorch)
 try:
     from mamba_ssm import Mamba2
     MAMBA_AVAILABLE = True
@@ -31,7 +31,8 @@ except ImportError:
     except ImportError:
         MAMBA_AVAILABLE = False
         MAMBA_VERSION = 0
-        print("Warning: mamba-ssm not installed. Using placeholder SSM.")
+        from .mamba_minimal import MambaMinimal
+        print("Info: mamba-ssm not installed. Using pure-PyTorch MambaMinimal (same math, no CUDA kernels).")
 
 
 # =============================================================================
@@ -255,8 +256,8 @@ class GatedAttention(nn.Module):
 
 class SSMLayer(nn.Module):
     """
-    State Space Model layer. Uses Mamba-2 if available, otherwise a 
-    simpler convolutional alternative.
+    State Space Model layer. Uses Mamba-2 if available, then Mamba-1,
+    then falls back to MambaMinimal (pure PyTorch, same math).
     """
     
     def __init__(
@@ -288,22 +289,16 @@ class SSMLayer(nn.Module):
                 )
             self.use_mamba = True
         else:
-            # Fallback: Gated convolution (not as good, but works)
-            self.ssm = self._build_conv_ssm(d_model, d_conv, expand)
-            self.use_mamba = False
+            # Pure-PyTorch Mamba: same selective SSM math, no CUDA kernels
+            # This is NOT a placeholder — it's mathematically identical to Mamba
+            self.ssm = MambaMinimal(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+            )
+            self.use_mamba = True  # MambaMinimal IS a real SSM
             
-    def _build_conv_ssm(self, d_model: int, d_conv: int, expand: int):
-        """Simple gated conv as Mamba fallback."""
-        inner_dim = d_model * expand
-        return nn.Sequential(
-            nn.Linear(d_model, inner_dim * 2, bias=False),
-            nn.GLU(dim=-1),
-            # Causal conv
-            nn.Conv1d(inner_dim, inner_dim, d_conv, padding=d_conv-1, groups=inner_dim),
-            nn.SiLU(),
-            nn.Linear(inner_dim, d_model, bias=False),
-        )
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -311,18 +306,7 @@ class SSMLayer(nn.Module):
         Returns:
             output: [batch, seq_len, d_model]
         """
-        if self.use_mamba:
-            return self.ssm(x)
-        else:
-            # Conv fallback needs channel-first
-            B, L, D = x.shape
-            out = self.ssm[0](x)  # Linear + GLU
-            out = self.ssm[1](out)
-            out = out.transpose(1, 2)  # [B, D, L]
-            out = self.ssm[2](out)[:, :, :L]  # Causal conv, trim
-            out = self.ssm[3](out.transpose(1, 2))  # SiLU
-            out = self.ssm[4](out)  # Project back
-            return out
+        return self.ssm(x)
 
 
 # =============================================================================
