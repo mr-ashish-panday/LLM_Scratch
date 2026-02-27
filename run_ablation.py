@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--save_every", type=int, default=5000)
+    parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42, help="RNG seed (same for all modes)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
