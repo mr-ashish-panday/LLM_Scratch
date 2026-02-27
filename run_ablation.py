@@ -277,15 +277,20 @@ def train(args):
             "lambda_eff": lambda_eff,
         }
 
-        # Add routing stats
+        # Add routing stats (only present on log steps, stored directly — NOT accumulated)
         if outputs["routing_stats"]:
             attn_ratios = [s.get("attn_ratio", 0.5) for s in outputs["routing_stats"]]
             ssm_ratios = [s.get("ssm_ratio", 0.5) for s in outputs["routing_stats"]]
-            step_metrics["attn_ratio"] = sum(attn_ratios) / len(attn_ratios)
-            step_metrics["ssm_ratio"] = sum(ssm_ratios) / len(ssm_ratios)
+            # Store as "_snap" so they don't get averaged in accum_metrics
+            step_metrics["_attn_ratio_snap"] = sum(attn_ratios) / len(attn_ratios)
+            step_metrics["_ssm_ratio_snap"] = sum(ssm_ratios) / len(ssm_ratios)
 
+        # Accumulate only non-snapshot metrics
         for k, v in step_metrics.items():
-            accum_metrics[k] = accum_metrics.get(k, 0) + v
+            if not k.startswith("_"):
+                accum_metrics[k] = accum_metrics.get(k, 0) + v
+            else:
+                accum_metrics[k] = v  # Overwrite, don't accumulate
 
         global_step += 1
 
@@ -294,7 +299,10 @@ def train(args):
             elapsed = time.time() - start_time
             tok_sec = tokens_processed / elapsed
 
-            avg = {k: v / args.log_interval for k, v in accum_metrics.items()}
+            avg = {k: v / args.log_interval for k, v in accum_metrics.items() if not k.startswith("_")}
+            # Add snapshots as-is
+            avg["attn_ratio"] = accum_metrics.get("_attn_ratio_snap", 0.5)
+            avg["ssm_ratio"] = accum_metrics.get("_ssm_ratio_snap", 0.5)
             accum_metrics = {}
 
             ppl = avg.get("ppl", 0)

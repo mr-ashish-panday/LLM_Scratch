@@ -147,7 +147,10 @@ class MambaMinimal(nn.Module):
     
     def _selective_scan(self, x, dt, A, B, C):
         """
-        Sequential selective scan.
+        Memory-efficient sequential selective scan.
+        
+        Computes per-timestep to avoid materializing [B, L, d_inner, d_state]
+        tensors (which caused OOM at seq_len=512 with 8 layers).
         
         Args:
             x:  [B, L, d_inner] — input
@@ -162,26 +165,18 @@ class MambaMinimal(nn.Module):
         batch, seq_len, d_inner = x.shape
         d_state = A.shape[1]
         
-        # Discretize A and B using ZOH (zero-order hold)
-        # dA = exp(dt * A)  — [B, L, d_inner, d_state]
-        # dB = dt * B       — [B, L, d_inner, d_state]
-        dt_expanded = dt.unsqueeze(-1)  # [B, L, d_inner, 1]
-        A_expanded = A.unsqueeze(0).unsqueeze(0)  # [1, 1, d_inner, d_state]
-        
-        dA = torch.exp(dt_expanded * A_expanded)  # [B, L, d_inner, d_state]
-        
-        # B needs to be broadcast: [B, L, 1, d_state] * [B, L, d_inner, 1]
-        B_expanded = B.unsqueeze(2)  # [B, L, 1, d_state]
-        x_expanded = x.unsqueeze(-1)  # [B, L, d_inner, 1]
-        dBx = dt_expanded * B_expanded * x_expanded  # [B, L, d_inner, d_state]
-        
-        # Sequential scan
+        # Sequential scan — compute per-timestep to save memory
         h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
         ys = []
         
         for t in range(seq_len):
-            h = dA[:, t] * h + dBx[:, t]  # [B, d_inner, d_state]
-            y_t = torch.einsum('bdn,bdn->bd', h, C[:, t].unsqueeze(1).expand_as(h))
+            # Discretize at this timestep only (no big pre-computed tensors)
+            dt_t = dt[:, t].unsqueeze(-1)          # [B, d_inner, 1]
+            dA_t = torch.exp(dt_t * A)              # [B, d_inner, d_state]
+            dBx_t = dt_t * B[:, t].unsqueeze(1) * x[:, t].unsqueeze(-1)  # [B, d_inner, d_state]
+            
+            h = dA_t * h + dBx_t                    # [B, d_inner, d_state]
+            y_t = (h * C[:, t].unsqueeze(1)).sum(-1) # [B, d_inner]
             ys.append(y_t)
         
         y = torch.stack(ys, dim=1)  # [B, L, d_inner]
