@@ -1,11 +1,16 @@
 #!/bin/bash
 # =============================================
 # ESH Training — Push Everything to GitHub + HF
-# Usage: bash push_all.sh GH_TOKEN HF_TOKEN
+# Run: bash push_all.sh
+# Tokens are entered securely (hidden input)
 # =============================================
 
-GH_TOKEN=$1
-HF_TOKEN=$2
+echo -n "Enter GitHub token: "
+read -s GH_TOKEN
+echo ""
+echo -n "Enter HuggingFace token (press Enter to skip): "
+read -s HF_TOKEN
+echo ""
 
 if [ -z "$GH_TOKEN" ]; then
   echo "ERROR: Provide GitHub token as first argument"
