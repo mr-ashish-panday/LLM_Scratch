@@ -78,7 +78,7 @@ else:
     batch = 8
 
 # Set max steps based on mamba availability
-max_steps = 25000 if mamba_ok else 5000
+max_steps = 25000 if mamba_ok else 30000
 
 # Extra safety: if T4 or small GPU without mamba, reduce batch more
 if vram_gb < 20 and not mamba_ok:
