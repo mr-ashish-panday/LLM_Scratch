@@ -1,16 +1,11 @@
 """
-ESH-Unified Router v2: Hard Routing via Gumbel-Softmax
-======================================================
+Hard Width Router: Token-Level SSM/Attention Assignment
+=======================================================
 
-ARCHITECTURAL PIVOT (Feb 25, 2026):
-The original soft-sigmoid router (α·Attn + (1-α)·SSM) was proven to be a
-dead coin flip. Root cause: soft blending creates an "ensembling attractor"
-at α=0.5 because the LM loss prefers maximum representational bandwidth.
-
-This rewrite uses Gumbel-Softmax with Straight-Through Estimator (STE):
+Gumbel-Softmax with Straight-Through Estimator (STE):
 - Forward pass: hard one-hot routing (exactly one path per token)
 - Backward pass: continuous gradients through softmax approximation
-- Ensembling is IMPOSSIBLE: ssm_mask ∈ {0,1}, attn_mask ∈ {0,1}
+- Each token goes to EXACTLY one path: ssm_mask ∈ {0,1}, attn_mask ∈ {0,1}
 """
 
 import torch

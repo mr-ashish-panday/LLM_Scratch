@@ -1,16 +1,14 @@
 """
-ESH Width × Depth Ablation Training Script
-============================================
-Runs 4 ablation modes to populate the core paper table:
+Width Routing Ablation Training Script
+=======================================
+Runs ablation modes to populate the core paper comparison table:
 
-  python run_ablation.py --mode baseline
-  python run_ablation.py --mode width_only
-  python run_ablation.py --mode depth_only
-  python run_ablation.py --mode unified
+  python run_ablation.py --mode baseline         # Random 50/50 routing (control)
+  python run_ablation.py --mode width_only        # Learned hard routing (the method)
+  python run_ablation.py --mode compare           # Compare all completed runs
 
 All modes use identical architecture, data, and hyperparameters.
-The ONLY difference is whether width routing (α) and depth routing
-(pondering) are enabled or disabled.
+The ONLY difference is the routing mechanism.
 
 Results are saved to results/<mode>/ for comparison.
 """

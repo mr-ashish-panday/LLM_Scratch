@@ -1,11 +1,6 @@
 """
-ESH-Unified Model v2: Hard Routing with Compute Penalty
-========================================================
-
-ARCHITECTURAL PIVOT (Feb 25, 2026):
-- Soft blending → Hard Gumbel-Softmax routing
-- Variance/Balance/Z-loss → Single compute cost penalty
-- ACT pondering → Disabled (SSM state collision)
+Hard Width Routing Model: Hybrid SSM-Attention with Compute Penalty
+====================================================================
 
 The compute penalty creates an economic incentive:
   L_total = L_lm + λ * mean(attn_masks_across_all_layers)
@@ -29,14 +24,11 @@ from .layers import UnifiedBlock
 @dataclass
 class UnifiedConfig:
     """
-    Configuration for the Unified ESH Model v2.
+    Configuration for Hard Width Routing Model.
 
-    The key flags are enable_width_routing and enable_depth_routing,
-    which control the ablation modes:
+    Ablation modes controlled by enable_width_routing:
       - baseline:    width=False  → random 50/50 hard routing
       - width_only:  width=True   → learned hard routing
-    
-    Depth routing is disabled (ACT + SSM state collision).
     """
     # Model architecture
     vocab_size: int = 50257

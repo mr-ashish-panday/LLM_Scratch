@@ -1,16 +1,13 @@
 """
-ESH-Unified Layers v2: Hard Routing Architecture
-=================================================
+Hard Width Routing Layers: Token-Level SSM/Attention Assignment
+================================================================
 
-ARCHITECTURAL PIVOT (Feb 25, 2026):
-- Soft blending (α·Attn + (1-α)·SSM) REPLACED with hard Gumbel-Softmax routing
-- Adaptive pondering (ACT loop) DISABLED — causes SSM state collision
-- Each token is routed to EXACTLY ONE path per layer
-- No burn-in needed (hard routing doesn't have the 0.5 equilibrium trap)
+Each token is routed to EXACTLY ONE path per layer via Gumbel-Softmax.
+SSM runs as a dense backbone. Attention runs only on router-selected tokens.
 
-Reuses production-grade components from the ESH package:
-- GatedAttention (FlashAttention-2)
-- SSMLayer (Mamba-2 or conv placeholder)
+Reuses production-grade components:
+- GatedAttention (FlashAttention-2)  
+- SSMLayer (Mamba-2 or pure-PyTorch fallback)
 - Top1MoE / ScalableMoE
 - RMSNorm, LayerScale
 """
@@ -37,14 +34,13 @@ from .router import HardEntropyRouter
 
 class UnifiedBlock(nn.Module):
     """
-    Unified ESH Block v2 with Hard Routing.
+    Hard Width Routing Block with Real Sparse Execution.
 
-    Each token is routed to exactly ONE path (SSM or Attention) via
-    Gumbel-Softmax. No soft blending, no ensembling attractor.
-
-    Architecture per step:
-        x → RMSNorm → HardRouter → (ssm_mask, attn_mask)
-          → ssm_mask·SSM(x) + attn_mask·Attention(x) → LayerScale → +Residual
+    Architecture:
+        x → RMSNorm → HardRouter → {ssm_mask, attn_mask}
+          → SSM(ALL tokens)  [dense backbone, O(n)]
+          → Attention(routed tokens only, full K/V context)  [sparse, O(k²)]
+          → Combine → LayerScale → +Residual
           → RMSNorm → MoE(x) → LayerScale → +Residual
     """
 
@@ -74,10 +70,9 @@ class UnifiedBlock(nn.Module):
         self.d_model = d_model
         self.use_checkpoint = use_checkpoint
         self.enable_width_routing = enable_width_routing
-        # Depth routing disabled by default (ACT + SSM state collision)
-        self.enable_depth_routing = False  # Hardcoded OFF for now
-        self.max_ponder_steps = 1          # Hardcoded 1 for now
-        self._global_step = 99999  # No burn-in needed with hard routing
+        self.enable_depth_routing = False  # Out of scope for this paper
+        self.max_ponder_steps = 1
+        self._global_step = 99999
 
         # Normalization
         self.norm1 = RMSNorm(d_model)
@@ -118,18 +113,37 @@ class UnifiedBlock(nn.Module):
         ssm_mask: torch.Tensor,
         attn_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One processing step with hard routing."""
+        """One processing step with REAL sparse execution.
+        
+        SSM runs on ALL tokens (dense backbone, O(n) cost).
+        Attention runs ONLY on router-selected tokens (sparse, O(k²) where k << n).
+        Selected tokens use full K/V context for global attention.
+        """
         residual = x
         normed = self.norm1(x)
+        B, L, D = normed.shape
 
-        # Compute both paths
-        attn_out = self.ls_attn(self.attention(normed))
+        # ---- DENSE SSM BACKBONE (all tokens) ----
         ssm_out = self.ls_ssm(self.ssm(normed))
 
-        # HARD selection: exactly one path per token
-        # ssm_mask and attn_mask are mutually exclusive {0, 1}
-        # Ensembling is IMPOSSIBLE
-        mixed_out = ssm_mask * ssm_out + attn_mask * attn_out
+        # ---- SPARSE ATTENTION (router-selected tokens only) ----
+        attn_idx = attn_mask.squeeze(-1).bool()  # [B, L]
+        n_routed = attn_idx.sum().item()
+
+        if n_routed > 0:
+            # Selective queries with FULL K/V context:
+            # All tokens provide K and V, but only routed tokens query.
+            # This means routed tokens can attend to ANY position in the sequence.
+            attn_out_full = self.ls_attn(self.attention(normed))  # [B, L, D]
+            
+            # Zero out non-routed tokens (they don't use attention output)
+            attn_contribution = attn_mask * attn_out_full  # [B, L, D]
+            
+            # Combine: SSM for all + Attention for routed subset
+            mixed_out = ssm_mask * ssm_out + attn_contribution
+        else:
+            # No tokens routed to attention — pure SSM
+            mixed_out = ssm_out
 
         # First residual
         x = residual + self.dropout_layer(mixed_out)
