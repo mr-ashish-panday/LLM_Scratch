@@ -70,11 +70,16 @@ def estimate_flops_per_token(config: UnifiedConfig, avg_ponder_steps: float) -> 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ESH v2 Hard Routing Ablation")
+    parser = argparse.ArgumentParser(description="Hard Width Routing Ablation")
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["baseline", "width_only", "compare"],
-        help="Ablation mode (depth routing disabled — ACT+SSM collision)"
+        choices=[
+            "baseline", "width_only", "compare",
+            "pure_transformer", "pure_ssm",
+            "interleaved_1_1", "interleaved_1_5",
+            "random_topk",
+        ],
+        help="Ablation mode"
     )
     parser.add_argument("--max_steps", type=int, default=25000)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -104,13 +109,24 @@ def parse_args():
                         help="Gumbel-Softmax temperature")
     parser.add_argument("--penalty-warmup", type=int, default=2000,
                         help="Steps before enabling compute penalty")
+    parser.add_argument("--attn-budget", type=float, default=0.07,
+                        help="Attention budget fraction for random_topk mode")
 
     return parser.parse_args()
 
 
 def get_config(args) -> UnifiedConfig:
     """Create config based on ablation mode."""
-    width = args.mode == "width_only"
+    mode = args.mode
+    
+    # Determine routing flags based on mode
+    if mode == "width_only":
+        width = True
+    elif mode == "random_topk":
+        # Uses UnifiedBlock but with random budget-matched routing
+        width = False  # No learned routing
+    else:
+        width = False
 
     return UnifiedConfig(
         vocab_size=50257,
@@ -121,11 +137,13 @@ def get_config(args) -> UnifiedConfig:
         max_seq_len=args.seq_len,
         use_checkpoint=True,
         enable_width_routing=width,
-        enable_depth_routing=False,  # Disabled (ACT+SSM collision)
+        enable_depth_routing=False,
         max_ponder_steps=1,
         compute_penalty_weight=args.lambda_cost,
         router_temperature=args.temperature,
         use_moe=not getattr(args, 'no_moe', False),
+        mode=mode,
+        attn_budget=getattr(args, 'attn_budget', 0.07),
     )
 
 

@@ -32,6 +32,90 @@ from esh.layers import (
 from .router import HardEntropyRouter
 
 
+class PureAttentionBlock(nn.Module):
+    """Pure Transformer block: Attention + FFN only (no SSM). Upper-bound baseline."""
+
+    def __init__(self, d_model=768, n_heads=12, n_experts=4, expert_dim=None,
+                 dropout=0.0, layer_scale_init=1e-5, use_flash=True,
+                 use_checkpoint=True, use_moe=True):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.attention = GatedAttention(d_model, n_heads, dropout, use_flash)
+        self.ls_attn = LayerScale(d_model, layer_scale_init)
+        self.ls_ffn = LayerScale(d_model, layer_scale_init)
+        self.use_moe = use_moe
+        if not use_moe:
+            self.ffn = SwiGLUExpert(d_model, expert_dim or d_model * 4)
+        elif n_experts > 4:
+            self.moe = ScalableMoE(d_model, n_experts, expert_dim)
+        else:
+            self.moe = Top1MoE(d_model, n_experts, expert_dim)
+        self.dropout_layer = nn.Dropout(dropout)
+        self.current_attn_mask = None  # Always 1.0 for pure attention
+
+    def forward(self, x, return_routing_stats=False):
+        B, L, D = x.shape
+        residual = x
+        normed = self.norm1(x)
+        attn_out = self.ls_attn(self.attention(normed))
+        x = residual + self.dropout_layer(attn_out)
+        residual = x
+        normed = self.norm2(x)
+        if self.use_moe:
+            ffn_out, moe_aux = self.moe(normed)
+        else:
+            ffn_out = self.ffn(normed)
+            moe_aux = torch.tensor(0.0, device=x.device)
+        x = residual + self.dropout_layer(self.ls_ffn(ffn_out))
+        self.current_attn_mask = torch.ones(1, device=x.device)
+        stats = {"attn_ratio": 1.0, "ssm_ratio": 0.0, "avg_ponder_steps": 1.0} if return_routing_stats else {}
+        return x, moe_aux, 0.0, stats
+
+
+class PureSSMBlock(nn.Module):
+    """Pure SSM block: Mamba + FFN only (no Attention). Lower-bound baseline."""
+
+    def __init__(self, d_model=768, d_state=16, d_conv=4, ssm_expand=2,
+                 n_experts=4, expert_dim=None, dropout=0.0,
+                 layer_scale_init=1e-5, use_checkpoint=True, use_moe=True):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.ssm = SSMLayer(d_model, d_state, d_conv, ssm_expand)
+        self.ls_ssm = LayerScale(d_model, layer_scale_init)
+        self.ls_ffn = LayerScale(d_model, layer_scale_init)
+        self.use_moe = use_moe
+        if not use_moe:
+            self.ffn = SwiGLUExpert(d_model, expert_dim or d_model * 4)
+        elif n_experts > 4:
+            self.moe = ScalableMoE(d_model, n_experts, expert_dim)
+        else:
+            self.moe = Top1MoE(d_model, n_experts, expert_dim)
+        self.dropout_layer = nn.Dropout(dropout)
+        self.current_attn_mask = None  # Always 0.0 for pure SSM
+
+    def forward(self, x, return_routing_stats=False):
+        B, L, D = x.shape
+        residual = x
+        normed = self.norm1(x)
+        ssm_out = self.ls_ssm(self.ssm(normed))
+        x = residual + self.dropout_layer(ssm_out)
+        residual = x
+        normed = self.norm2(x)
+        if self.use_moe:
+            ffn_out, moe_aux = self.moe(normed)
+        else:
+            ffn_out = self.ffn(normed)
+            moe_aux = torch.tensor(0.0, device=x.device)
+        x = residual + self.dropout_layer(self.ls_ffn(ffn_out))
+        self.current_attn_mask = torch.zeros(1, device=x.device)
+        stats = {"attn_ratio": 0.0, "ssm_ratio": 1.0, "avg_ponder_steps": 1.0} if return_routing_stats else {}
+        return x, moe_aux, 0.0, stats
+
+
 class UnifiedBlock(nn.Module):
     """
     Hard Width Routing Block with Real Sparse Execution.
@@ -65,6 +149,9 @@ class UnifiedBlock(nn.Module):
         halt_threshold: float = 0.99,
         # Router temperature
         router_temperature: float = 1.0,
+        # Mode and budget for random_topk
+        mode: str = "width_only",
+        attn_budget: float = 0.07,
     ):
         super().__init__()
         self.d_model = d_model
@@ -73,6 +160,8 @@ class UnifiedBlock(nn.Module):
         self.enable_depth_routing = False  # Out of scope for this paper
         self.max_ponder_steps = 1
         self._global_step = 99999
+        self.mode = mode
+        self.attn_budget = attn_budget
 
         # Normalization
         self.norm1 = RMSNorm(d_model)
@@ -185,9 +274,16 @@ class UnifiedBlock(nn.Module):
             router_out = self.router(x)
             ssm_mask = router_out.ssm_mask      # [B, L, 1]
             attn_mask = router_out.attn_mask     # [B, L, 1]
+        elif self.mode == "random_topk":
+            # Budget-matched random routing: match learned router's attn fraction
+            k = max(1, int(L * self.attn_budget))
+            rand_scores = torch.rand(B, L, device=device)
+            topk_idx = rand_scores.topk(k, dim=-1).indices
+            attn_mask = torch.zeros(B, L, 1, device=device)
+            attn_mask.scatter_(1, topk_idx.unsqueeze(-1), 1.0)
+            ssm_mask = 1.0 - attn_mask
         else:
             # Baseline: random 50/50 routing (no learning)
-            # Use hard random masks, not soft 0.5 blend
             random_choice = (torch.rand(B, L, 1, device=device) > 0.5).float()
             ssm_mask = random_choice
             attn_mask = 1.0 - random_choice

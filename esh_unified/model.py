@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
 from esh.layers import RMSNorm
-from .layers import UnifiedBlock
+from .layers import UnifiedBlock, PureAttentionBlock, PureSSMBlock
 
 
 @dataclass
@@ -27,8 +27,13 @@ class UnifiedConfig:
     Configuration for Hard Width Routing Model.
 
     Ablation modes controlled by enable_width_routing:
-      - baseline:    width=False  → random 50/50 hard routing
-      - width_only:  width=True   → learned hard routing
+      - baseline:         Random 50/50 hard routing (control)
+      - width_only:       Learned hard routing (the method)
+      - pure_transformer: Attention-only (no SSM)
+      - pure_ssm:         SSM-only (no Attention)
+      - interleaved_1_1:  Alternating SSM/Attn layers (4+4)
+      - interleaved_1_5:  1 Attn per 5 SSM layers
+      - random_topk:      Budget-matched random routing (~7%)
     """
     # Model architecture
     vocab_size: int = 50257
@@ -51,78 +56,53 @@ class UnifiedConfig:
 
     # Ablation flags
     enable_width_routing: bool = True
-    enable_depth_routing: bool = False  # Disabled (ACT+SSM collision)
-    max_ponder_steps: int = 1           # Always 1
+    enable_depth_routing: bool = False
+    max_ponder_steps: int = 1
     use_moe: bool = True
 
-    # Compute penalty (the economic incentive)
-    # λ = 0.01 means Attention must improve CE loss by >0.01 to be chosen
+    # Compute penalty
     compute_penalty_weight: float = 0.01
-    
-    # Router temperature for Gumbel-Softmax
     router_temperature: float = 1.0
-
-    # Legacy loss weights (kept for compatibility, not used in v2)
     ponder_cost_weight: float = 0.0
     moe_aux_weight: float = 0.01
 
-    # Ablation mode name (auto-computed)
+    # Ablation mode name
     mode: str = ""
+
+    # Attention budget for random_topk mode (fraction 0-1)
+    attn_budget: float = 0.07
 
     def __post_init__(self):
         if self.expert_dim is None:
             self.expert_dim = self.d_model * 4
-        # Set mode name
-        if self.enable_width_routing:
-            self.mode = "width_only"
-        else:
-            self.mode = "baseline"
+        if not self.mode:
+            if self.enable_width_routing:
+                self.mode = "width_only"
+            else:
+                self.mode = "baseline"
 
 
 class UnifiedModel(nn.Module):
     """
-    Unified ESH Language Model v2 with Hard Routing.
+    Hard Width Routing Language Model.
 
-    Key differences from v1:
-    - Router outputs hard masks via Gumbel-Softmax (no soft blending)
-    - Compute penalty replaces variance/balance/z-loss
-    - No ACT pondering (disabled)
-    - No burn-in needed
+    Supports multiple ablation modes — all share the same embedding layer
+    and LM head for fair comparison. Only the block types differ.
     """
 
     def __init__(self, config: UnifiedConfig):
         super().__init__()
         self.config = config
 
-        # Embeddings
+        # Embeddings (shared across all modes)
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
         self.emb_dropout = nn.Dropout(config.dropout)
 
-        # Unified blocks
-        self.blocks = nn.ModuleList([
-            UnifiedBlock(
-                d_model=config.d_model,
-                n_heads=config.n_heads,
-                d_state=config.d_state,
-                d_conv=config.d_conv,
-                ssm_expand=config.ssm_expand,
-                n_experts=config.n_experts,
-                expert_dim=config.expert_dim,
-                dropout=config.dropout,
-                layer_scale_init=config.layer_scale_init,
-                use_flash=config.use_flash,
-                use_checkpoint=config.use_checkpoint,
-                enable_width_routing=config.enable_width_routing,
-                enable_depth_routing=False,
-                max_ponder_steps=1,
-                use_moe=config.use_moe,
-                router_temperature=config.router_temperature,
-            )
-            for _ in range(config.n_layers)
-        ])
+        # Build blocks based on mode
+        self.blocks = nn.ModuleList(self._build_blocks(config))
 
-        # Final norm and LM head
+        # Final norm and LM head (shared across all modes)
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -134,6 +114,79 @@ class UnifiedModel(nn.Module):
 
         # Count parameters
         self.n_params = sum(p.numel() for p in self.parameters())
+
+    def _build_blocks(self, config):
+        """Construct block list based on ablation mode."""
+        blocks = []
+        for i in range(config.n_layers):
+            if config.mode == "pure_transformer":
+                blocks.append(PureAttentionBlock(
+                    d_model=config.d_model, n_heads=config.n_heads,
+                    n_experts=config.n_experts, expert_dim=config.expert_dim,
+                    dropout=config.dropout, layer_scale_init=config.layer_scale_init,
+                    use_flash=config.use_flash, use_checkpoint=config.use_checkpoint,
+                    use_moe=config.use_moe,
+                ))
+            elif config.mode == "pure_ssm":
+                blocks.append(PureSSMBlock(
+                    d_model=config.d_model, d_state=config.d_state,
+                    d_conv=config.d_conv, ssm_expand=config.ssm_expand,
+                    n_experts=config.n_experts, expert_dim=config.expert_dim,
+                    dropout=config.dropout, layer_scale_init=config.layer_scale_init,
+                    use_checkpoint=config.use_checkpoint, use_moe=config.use_moe,
+                ))
+            elif config.mode == "interleaved_1_1":
+                # Alternating: even layers = SSM, odd layers = Attention
+                # Following hybrid analysis: don't put Transformer first
+                if i % 2 == 0:
+                    blocks.append(PureSSMBlock(
+                        d_model=config.d_model, d_state=config.d_state,
+                        d_conv=config.d_conv, ssm_expand=config.ssm_expand,
+                        n_experts=config.n_experts, expert_dim=config.expert_dim,
+                        dropout=config.dropout, use_checkpoint=config.use_checkpoint,
+                        use_moe=config.use_moe,
+                    ))
+                else:
+                    blocks.append(PureAttentionBlock(
+                        d_model=config.d_model, n_heads=config.n_heads,
+                        n_experts=config.n_experts, expert_dim=config.expert_dim,
+                        dropout=config.dropout, use_flash=config.use_flash,
+                        use_checkpoint=config.use_checkpoint, use_moe=config.use_moe,
+                    ))
+            elif config.mode == "interleaved_1_5":
+                # 1 Attention per 5 SSM: layers 2 and 7 get Attention (middle placement)
+                attn_layers = {2, 7}  # ~25% attention layers, placed in middle
+                if i in attn_layers:
+                    blocks.append(PureAttentionBlock(
+                        d_model=config.d_model, n_heads=config.n_heads,
+                        n_experts=config.n_experts, expert_dim=config.expert_dim,
+                        dropout=config.dropout, use_flash=config.use_flash,
+                        use_checkpoint=config.use_checkpoint, use_moe=config.use_moe,
+                    ))
+                else:
+                    blocks.append(PureSSMBlock(
+                        d_model=config.d_model, d_state=config.d_state,
+                        d_conv=config.d_conv, ssm_expand=config.ssm_expand,
+                        n_experts=config.n_experts, expert_dim=config.expert_dim,
+                        dropout=config.dropout, use_checkpoint=config.use_checkpoint,
+                        use_moe=config.use_moe,
+                    ))
+            else:
+                # baseline, width_only, random_topk — all use UnifiedBlock
+                blocks.append(UnifiedBlock(
+                    d_model=config.d_model, n_heads=config.n_heads,
+                    d_state=config.d_state, d_conv=config.d_conv,
+                    ssm_expand=config.ssm_expand, n_experts=config.n_experts,
+                    expert_dim=config.expert_dim, dropout=config.dropout,
+                    layer_scale_init=config.layer_scale_init,
+                    use_flash=config.use_flash, use_checkpoint=config.use_checkpoint,
+                    enable_width_routing=config.enable_width_routing,
+                    use_moe=config.use_moe,
+                    router_temperature=config.router_temperature,
+                    mode=config.mode,
+                    attn_budget=config.attn_budget,
+                ))
+        return blocks
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
