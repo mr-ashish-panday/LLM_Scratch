@@ -76,8 +76,8 @@ def parse_args():
         choices=[
             "baseline", "width_only", "compare",
             "pure_transformer", "pure_ssm",
-            "interleaved_1_1", "interleaved_1_5",
-            "random_topk",
+            "interleaved_1_1", "interleaved_1_5", "interleaved_1_7",
+            "random_topk", "entropy_topk",
         ],
         help="Ablation mode"
     )
@@ -110,7 +110,7 @@ def parse_args():
     parser.add_argument("--penalty-warmup", type=int, default=2000,
                         help="Steps before enabling compute penalty")
     parser.add_argument("--attn-budget", type=float, default=0.07,
-                        help="Attention budget fraction for random_topk mode")
+                        help="Attention budget fraction for random_topk/entropy_topk modes")
 
     return parser.parse_args()
 
@@ -122,8 +122,8 @@ def get_config(args) -> UnifiedConfig:
     # Determine routing flags based on mode
     if mode == "width_only":
         width = True
-    elif mode == "random_topk":
-        # Uses UnifiedBlock but with random budget-matched routing
+    elif mode in ("random_topk", "entropy_topk"):
+        # Uses UnifiedBlock but with heuristic/random budget-matched routing
         width = False  # No learned routing
     else:
         width = False
@@ -156,7 +156,7 @@ def cosine_lr(step, warmup, max_steps, max_lr, min_lr=1e-5):
 
 
 def train(args):
-    # Determinism — identical seeds across all 4 ablation runs
+    # Determinism — identical seeds across all ablation runs
     set_deterministic(args.seed)
 
     # Device
@@ -229,6 +229,7 @@ def train(args):
     data_iter = iter(train_loader)
     metrics_log = []
     accum_metrics = {}
+    last_step_metrics = None
     global_step = start_step
     start_time = time.time()
     tokens_processed = 0
@@ -292,6 +293,7 @@ def train(args):
             "compute_penalty": compute_penalty.item() if torch.is_tensor(compute_penalty) else float(compute_penalty),
             "lambda_eff": lambda_eff,
         }
+        last_step_metrics = dict(step_metrics)
 
         # Add routing stats (only present on log steps, stored directly — NOT accumulated)
         if outputs["routing_stats"]:
@@ -319,6 +321,9 @@ def train(args):
             # Add snapshots as-is
             avg["attn_ratio"] = accum_metrics.get("_attn_ratio_snap", 0.5)
             avg["ssm_ratio"] = accum_metrics.get("_ssm_ratio_snap", 0.5)
+            avg["attention_ratio"] = avg["attn_ratio"]
+            avg["alpha_mean"] = avg["attn_ratio"]
+            avg["avg_ponder_steps"] = 1.0
             accum_metrics = {}
 
             ppl = avg.get("ppl", 0)
@@ -370,16 +375,34 @@ def train(args):
     # Final save
     # =========================================================================
     elapsed = time.time() - start_time
+    best_ppl_value = best_ppl
+    if math.isinf(best_ppl_value) and last_step_metrics:
+        best_ppl_value = last_step_metrics["ppl"]
+
+    final_loss = metrics_log[-1]["loss"] if metrics_log else (last_step_metrics["loss"] if last_step_metrics else None)
+    final_ppl = metrics_log[-1]["ppl"] if metrics_log else (last_step_metrics["ppl"] if last_step_metrics else None)
+    final_attn_ratio = (
+        metrics_log[-1].get("attn_ratio", 0.5)
+        if metrics_log
+        else (
+            last_step_metrics.get("_attn_ratio_snap", last_step_metrics.get("compute_penalty"))
+            if last_step_metrics else None
+        )
+    )
+    final_ssm_ratio = None if final_attn_ratio is None else 1.0 - final_attn_ratio
 
     final_metrics = {
         "mode": config.mode,
         "enable_width_routing": config.enable_width_routing,
         "enable_depth_routing": config.enable_depth_routing,
         "total_steps": global_step,
-        "best_ppl": best_ppl,
-        "final_loss": metrics_log[-1]["loss"] if metrics_log else None,
-        "final_ppl": metrics_log[-1]["ppl"] if metrics_log else None,
-        "final_attn_ratio": metrics_log[-1].get("attn_ratio", 0.5) if metrics_log else None,
+        "best_ppl": best_ppl_value,
+        "final_loss": final_loss,
+        "final_ppl": final_ppl,
+        "final_attn_ratio": final_attn_ratio,
+        "final_ssm_ratio": final_ssm_ratio,
+        "final_alpha_mean": final_attn_ratio,
+        "final_avg_ponder": 1.0,
         "total_time_hours": elapsed / 3600,
         "params_M": model.count_parameters() / 1e6,
     }
@@ -401,9 +424,15 @@ def train(args):
     print(f"\n{'='*60}")
     print(f"  TRAINING COMPLETE: {config.mode.upper()}")
     print(f"{'='*60}")
-    print(f"  Best PPL:       {best_ppl:.4f}")
-    print(f"  Final Loss:     {final_metrics['final_loss']:.4f}")
-    print(f"  Final Attn%:    {final_metrics['final_attn_ratio']*100:.1f}%")
+    print(f"  Best PPL:       {best_ppl_value:.4f}")
+    if final_metrics["final_loss"] is None:
+        print("  Final Loss:     n/a")
+    else:
+        print(f"  Final Loss:     {final_metrics['final_loss']:.4f}")
+    if final_metrics["final_attn_ratio"] is None:
+        print("  Final Attn%:    n/a")
+    else:
+        print(f"  Final Attn%:    {final_metrics['final_attn_ratio']*100:.1f}%")
     print(f"  Training Time:  {elapsed / 3600:.2f} hours")
     print(f"  Results saved:  {results_dir}/")
     print(f"{'='*60}")
@@ -414,12 +443,22 @@ def train(args):
 def compare_results():
     """Compare results across all completed ablation modes."""
     print(f"\n{'='*80}")
-    print(f"  ESH WIDTH × DEPTH ABLATION RESULTS")
+    print(f"  HARD WIDTH ROUTING ABLATION RESULTS")
     print(f"{'='*80}")
-    print(f"{'Mode':<15} {'Width':>6} {'Depth':>6} {'PPL':>8} {'α Mean':>8} {'Ponder':>8} {'Time(h)':>8}")
+    print(f"{'Mode':<18} {'Width':>6} {'Depth':>6} {'PPL':>8} {'Attn%':>8} {'Time(h)':>8}")
     print(f"{'-'*80}")
 
-    modes = ["baseline", "width_only", "depth_only", "unified"]
+    modes = [
+        "baseline",
+        "width_only",
+        "pure_transformer",
+        "pure_ssm",
+        "interleaved_1_1",
+        "interleaved_1_5",
+        "random_topk",
+        "depth_only",
+        "unified",
+    ]
     all_results = {}
 
     for mode in modes:
@@ -428,17 +467,17 @@ def compare_results():
             with open(fpath) as f:
                 r = json.load(f)
             all_results[mode] = r
+            attn_ratio = r.get("final_attn_ratio", r.get("final_alpha_mean", 0.5))
             print(
-                f"{mode:<15} "
+                f"{mode:<18} "
                 f"{'✓' if r['enable_width_routing'] else '✗':>6} "
                 f"{'✓' if r['enable_depth_routing'] else '✗':>6} "
                 f"{r['best_ppl']:>8.4f} "
-                f"{r.get('final_alpha_mean', 0.5):>8.3f} "
-                f"{r.get('final_avg_ponder', 1.0):>8.2f} "
+                f"{attn_ratio * 100:>7.1f}% "
                 f"{r.get('total_time_hours', 0):>8.2f}"
             )
         else:
-            print(f"{mode:<15} {'— not yet run —':>65}")
+            print(f"{mode:<18} {'— not yet run —':>62}")
 
     print(f"{'='*80}")
 

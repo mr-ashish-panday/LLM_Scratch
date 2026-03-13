@@ -2,11 +2,13 @@
 Hard Width Routing Layers: Token-Level SSM/Attention Assignment
 ================================================================
 
-Each token is routed to EXACTLY ONE path per layer via Gumbel-Softmax.
-SSM runs as a dense backbone. Attention runs only on router-selected tokens.
+Each token is routed to exactly one path per layer via Gumbel-Softmax.
+On large-memory GPUs we keep both paths dense and use the hard masks for
+selection, so the ablation behavior stays exact and we do not claim sparse
+attention speedups.
 
 Reuses production-grade components:
-- GatedAttention (FlashAttention-2)  
+- GatedAttention (FlashAttention-2)
 - SSMLayer (Mamba-2 or pure-PyTorch fallback)
 - Top1MoE / ScalableMoE
 - RMSNorm, LayerScale
@@ -30,6 +32,17 @@ from esh.layers import (
     RMSNorm,
 )
 from .router import HardEntropyRouter
+
+
+def _build_routing_stats(attn_ratio: float, ssm_ratio: float) -> Dict[str, float]:
+    """Return both current and legacy routing keys for local tooling."""
+    return {
+        "attn_ratio": attn_ratio,
+        "ssm_ratio": ssm_ratio,
+        "attention_ratio": attn_ratio,
+        "alpha_mean": attn_ratio,
+        "avg_ponder_steps": 1.0,
+    }
 
 
 class PureAttentionBlock(nn.Module):
@@ -56,7 +69,7 @@ class PureAttentionBlock(nn.Module):
         self.current_attn_mask = None  # Always 1.0 for pure attention
 
     def forward(self, x, return_routing_stats=False):
-        B, L, D = x.shape
+        B, L, _ = x.shape
         residual = x
         normed = self.norm1(x)
         attn_out = self.ls_attn(self.attention(normed))
@@ -69,8 +82,8 @@ class PureAttentionBlock(nn.Module):
             ffn_out = self.ffn(normed)
             moe_aux = torch.tensor(0.0, device=x.device)
         x = residual + self.dropout_layer(self.ls_ffn(ffn_out))
-        self.current_attn_mask = torch.ones(1, device=x.device)
-        stats = {"attn_ratio": 1.0, "ssm_ratio": 0.0, "avg_ponder_steps": 1.0} if return_routing_stats else {}
+        self.current_attn_mask = torch.ones(B, L, 1, device=x.device)
+        stats = _build_routing_stats(1.0, 0.0) if return_routing_stats else {}
         return x, moe_aux, 0.0, stats
 
 
@@ -98,7 +111,7 @@ class PureSSMBlock(nn.Module):
         self.current_attn_mask = None  # Always 0.0 for pure SSM
 
     def forward(self, x, return_routing_stats=False):
-        B, L, D = x.shape
+        B, L, _ = x.shape
         residual = x
         normed = self.norm1(x)
         ssm_out = self.ls_ssm(self.ssm(normed))
@@ -111,20 +124,19 @@ class PureSSMBlock(nn.Module):
             ffn_out = self.ffn(normed)
             moe_aux = torch.tensor(0.0, device=x.device)
         x = residual + self.dropout_layer(self.ls_ffn(ffn_out))
-        self.current_attn_mask = torch.zeros(1, device=x.device)
-        stats = {"attn_ratio": 0.0, "ssm_ratio": 1.0, "avg_ponder_steps": 1.0} if return_routing_stats else {}
+        self.current_attn_mask = torch.zeros(B, L, 1, device=x.device)
+        stats = _build_routing_stats(0.0, 1.0) if return_routing_stats else {}
         return x, moe_aux, 0.0, stats
 
 
 class UnifiedBlock(nn.Module):
     """
-    Hard Width Routing Block with Real Sparse Execution.
+    Hard Width Routing Block with dense dual-path execution.
 
     Architecture:
         x → RMSNorm → HardRouter → {ssm_mask, attn_mask}
-          → SSM(ALL tokens)  [dense backbone, O(n)]
-          → Attention(routed tokens only, full K/V context)  [sparse, O(k²)]
-          → Combine → LayerScale → +Residual
+          → SSM(x) + Attention(x)  [both dense]
+          → Hard-select one output per token → LayerScale → +Residual
           → RMSNorm → MoE(x) → LayerScale → +Residual
     """
 
@@ -202,37 +214,13 @@ class UnifiedBlock(nn.Module):
         ssm_mask: torch.Tensor,
         attn_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One processing step with REAL sparse execution.
-        
-        SSM runs on ALL tokens (dense backbone, O(n) cost).
-        Attention runs ONLY on router-selected tokens (sparse, O(k²) where k << n).
-        Selected tokens use full K/V context for global attention.
-        """
+        """One processing step with dense execution and hard output selection."""
         residual = x
         normed = self.norm1(x)
-        B, L, D = normed.shape
-
-        # ---- DENSE SSM BACKBONE (all tokens) ----
+        # Keep both paths dense on large GPUs so we do not change compute semantics.
+        attn_out = self.ls_attn(self.attention(normed))
         ssm_out = self.ls_ssm(self.ssm(normed))
-
-        # ---- SPARSE ATTENTION (router-selected tokens only) ----
-        attn_idx = attn_mask.squeeze(-1).bool()  # [B, L]
-        n_routed = attn_idx.sum().item()
-
-        if n_routed > 0:
-            # Selective queries with FULL K/V context:
-            # All tokens provide K and V, but only routed tokens query.
-            # This means routed tokens can attend to ANY position in the sequence.
-            attn_out_full = self.ls_attn(self.attention(normed))  # [B, L, D]
-            
-            # Zero out non-routed tokens (they don't use attention output)
-            attn_contribution = attn_mask * attn_out_full  # [B, L, D]
-            
-            # Combine: SSM for all + Attention for routed subset
-            mixed_out = ssm_mask * ssm_out + attn_contribution
-        else:
-            # No tokens routed to attention — pure SSM
-            mixed_out = ssm_out
+        mixed_out = ssm_mask * ssm_out + attn_mask * attn_out
 
         # First residual
         x = residual + self.dropout_layer(mixed_out)
@@ -276,11 +264,24 @@ class UnifiedBlock(nn.Module):
             attn_mask = router_out.attn_mask     # [B, L, 1]
         elif self.mode == "random_topk":
             # Budget-matched random routing: match learned router's attn fraction
-            k = max(1, int(L * self.attn_budget))
-            rand_scores = torch.rand(B, L, device=device)
-            topk_idx = rand_scores.topk(k, dim=-1).indices
             attn_mask = torch.zeros(B, L, 1, device=device)
-            attn_mask.scatter_(1, topk_idx.unsqueeze(-1), 1.0)
+            k = min(L, max(0, int(round(L * self.attn_budget))))
+            if k > 0:
+                rand_scores = torch.rand(B, L, device=device)
+                topk_idx = rand_scores.topk(k, dim=-1).indices
+                attn_mask.scatter_(1, topk_idx.unsqueeze(-1), 1.0)
+            ssm_mask = 1.0 - attn_mask
+        elif self.mode == "entropy_topk":
+            # Heuristic routing: route highest-complexity tokens to attention.
+            # Uses hidden-state L2 norm as complexity proxy (no learned params).
+            # High norm = high activation magnitude = likely complex/uncertain.
+            with torch.no_grad():
+                token_scores = x.norm(dim=-1)  # [B, L]
+            k = min(L, max(0, int(round(L * self.attn_budget))))
+            attn_mask = torch.zeros(B, L, 1, device=device)
+            if k > 0:
+                topk_idx = token_scores.topk(k, dim=-1).indices
+                attn_mask.scatter_(1, topk_idx.unsqueeze(-1), 1.0)
             ssm_mask = 1.0 - attn_mask
         else:
             # Baseline: random 50/50 routing (no learning)
@@ -304,11 +305,10 @@ class UnifiedBlock(nn.Module):
         stats = {}
         if return_routing_stats:
             with torch.no_grad():
-                stats = {
-                    "attn_ratio": attn_mask.mean().item(),
-                    "ssm_ratio": ssm_mask.mean().item(),
-                    "avg_ponder_steps": 1.0,
-                }
+                stats = _build_routing_stats(
+                    attn_mask.mean().item(),
+                    ssm_mask.mean().item(),
+                )
                 if self.enable_width_routing:
                     logits = self.router.complexity_net(x)
                     probs = F.softmax(logits, dim=-1)

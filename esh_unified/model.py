@@ -8,6 +8,9 @@ The compute penalty creates an economic incentive:
 The model pays a "tax" for routing tokens to Attention. It will only
 choose Attention when the CE loss reduction exceeds the tax. This is
 the mathematical engine that drives genuine specialization.
+
+Routing is hard at the token level, but execution stays dense so the
+ablation remains exact on large-memory GPUs.
 """
 
 import math
@@ -26,7 +29,7 @@ class UnifiedConfig:
     """
     Configuration for Hard Width Routing Model.
 
-    Ablation modes controlled by enable_width_routing:
+    Supported ablation modes:
       - baseline:         Random 50/50 hard routing (control)
       - width_only:       Learned hard routing (the method)
       - pure_transformer: Attention-only (no SSM)
@@ -115,9 +118,26 @@ class UnifiedModel(nn.Module):
         # Count parameters
         self.n_params = sum(p.numel() for p in self.parameters())
 
+    @staticmethod
+    def _select_interleaved_attn_layers(n_layers: int, ssm_per_attn: int):
+        """Place a small number of attention layers evenly through the stack."""
+        if n_layers <= 0:
+            return set()
+
+        n_attn = max(1, round(n_layers / (ssm_per_attn + 1)))
+        layers = set()
+        for idx in range(n_attn):
+            position = round((idx + 1) * (n_layers + 1) / (n_attn + 1)) - 1
+            position = max(0, min(n_layers - 1, position))
+            layers.add(position)
+        return layers
+
     def _build_blocks(self, config):
         """Construct block list based on ablation mode."""
         blocks = []
+        interleaved_1_5_attn_layers = self._select_interleaved_attn_layers(
+            config.n_layers, ssm_per_attn=5
+        )
         for i in range(config.n_layers):
             if config.mode == "pure_transformer":
                 blocks.append(PureAttentionBlock(
@@ -154,13 +174,13 @@ class UnifiedModel(nn.Module):
                         use_checkpoint=config.use_checkpoint, use_moe=config.use_moe,
                     ))
             elif config.mode == "interleaved_1_5":
-                # 1 Attention per 5 SSM: layers 2 and 7 get Attention (middle placement)
-                attn_layers = {2, 7}  # ~25% attention layers, placed in middle
-                if i in attn_layers:
+                # Approximate 1 attention layer per 5 SSM layers, spaced evenly.
+                if i in interleaved_1_5_attn_layers:
                     blocks.append(PureAttentionBlock(
                         d_model=config.d_model, n_heads=config.n_heads,
                         n_experts=config.n_experts, expert_dim=config.expert_dim,
-                        dropout=config.dropout, use_flash=config.use_flash,
+                        dropout=config.dropout, layer_scale_init=config.layer_scale_init,
+                        use_flash=config.use_flash,
                         use_checkpoint=config.use_checkpoint, use_moe=config.use_moe,
                     ))
                 else:
@@ -168,11 +188,35 @@ class UnifiedModel(nn.Module):
                         d_model=config.d_model, d_state=config.d_state,
                         d_conv=config.d_conv, ssm_expand=config.ssm_expand,
                         n_experts=config.n_experts, expert_dim=config.expert_dim,
-                        dropout=config.dropout, use_checkpoint=config.use_checkpoint,
+                        dropout=config.dropout, layer_scale_init=config.layer_scale_init,
+                        use_checkpoint=config.use_checkpoint,
+                        use_moe=config.use_moe,
+                    ))
+            elif config.mode == "interleaved_1_7":
+                # Nemotron/Zamba-style: 1 attention per 7 SSM layers (~12.5%).
+                # For 8 layers: layer 3 gets attention, rest SSM.
+                interleaved_1_7_attn_layers = self._select_interleaved_attn_layers(
+                    config.n_layers, ssm_per_attn=7
+                )
+                if i in interleaved_1_7_attn_layers:
+                    blocks.append(PureAttentionBlock(
+                        d_model=config.d_model, n_heads=config.n_heads,
+                        n_experts=config.n_experts, expert_dim=config.expert_dim,
+                        dropout=config.dropout, layer_scale_init=config.layer_scale_init,
+                        use_flash=config.use_flash,
+                        use_checkpoint=config.use_checkpoint, use_moe=config.use_moe,
+                    ))
+                else:
+                    blocks.append(PureSSMBlock(
+                        d_model=config.d_model, d_state=config.d_state,
+                        d_conv=config.d_conv, ssm_expand=config.ssm_expand,
+                        n_experts=config.n_experts, expert_dim=config.expert_dim,
+                        dropout=config.dropout, layer_scale_init=config.layer_scale_init,
+                        use_checkpoint=config.use_checkpoint,
                         use_moe=config.use_moe,
                     ))
             else:
-                # baseline, width_only, random_topk — all use UnifiedBlock
+                # baseline, width_only, random_topk, entropy_topk — all use UnifiedBlock
                 blocks.append(UnifiedBlock(
                     d_model=config.d_model, n_heads=config.n_heads,
                     d_state=config.d_state, d_conv=config.d_conv,
@@ -272,12 +316,25 @@ class UnifiedModel(nn.Module):
 
         # Compute penalty (attention usage tax)
         compute_penalty = self.get_compute_penalty()
+        mean_attn_ratio = compute_penalty.detach().item()
+        avg_ponder_steps = 1.0
+        if all_stats:
+            mean_attn_ratio = sum(
+                s.get("attention_ratio", s.get("attn_ratio", 0.0))
+                for s in all_stats
+            ) / len(all_stats)
+            avg_ponder_steps = sum(
+                s.get("avg_ponder_steps", 1.0) for s in all_stats
+            ) / len(all_stats)
 
         return {
             "logits": logits,
             "loss": loss,
             "aux_loss": total_aux_loss,
             "compute_penalty": compute_penalty,
+            "attention_ratio": mean_attn_ratio,
+            "alpha_mean": mean_attn_ratio,
+            "avg_ponder_steps": avg_ponder_steps,
             "routing_stats": all_stats if return_routing_stats else None,
         }
 
@@ -291,7 +348,7 @@ class UnifiedModel(nn.Module):
         print(f"╔{'═' * 50}╗")
         print(f"║ ESH-Unified v2 ({self.config.mode.upper()})".ljust(51) + "║")
         print(f"╠{'═' * 50}╣")
-        print(f"║ Routing: HARD (Gumbel-Softmax)".ljust(51) + "║")
+        print(f"║ Routing: HARD masks (dense execution)".ljust(51) + "║")
         print(f"║ Width Routing: {self.config.enable_width_routing}".ljust(51) + "║")
         print(f"║ Depth Routing: DISABLED (ACT collision)".ljust(51) + "║")
         print(f"║ Compute Penalty λ: {self.config.compute_penalty_weight}".ljust(51) + "║")
